@@ -576,7 +576,7 @@ describe("officePlugin", () => {
 
     await waitFor(() => Boolean(container.querySelector(".ofv-column-resize-handle")));
 
-    const firstCell = container.querySelector<HTMLTableCellElement>('[data-cell="A1"]');
+    const firstCell = container.querySelector<HTMLTableCellElement>('[data-cell="A2"]');
     const handle = firstCell?.querySelector<HTMLElement>(".ofv-column-resize-handle");
     firstCell!.getBoundingClientRect = () =>
       ({ width: 120, height: 24, top: 0, right: 120, bottom: 24, left: 0, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
@@ -589,6 +589,54 @@ describe("officePlugin", () => {
 
     expect(container.querySelector<HTMLTableElement>(".ofv-workbook-table")?.style.width).toBe("450px");
     expect(container.querySelector<HTMLTableColElement>('col[data-column-index="0"]')?.style.width).toBe("190px");
+  });
+
+  it("keeps every column resizable below a horizontally merged header", async () => {
+    const xlsx = await import("xlsx");
+    const sheet = xlsx.utils.aoa_to_sheet([
+      ["Merged header", ...Array.from({ length: 16 }, () => "")],
+      Array.from({ length: 17 }, (_, index) => `Column ${index + 1}`)
+    ]);
+    sheet["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 16 } }];
+    const workbook = xlsx.utils.book_new();
+    xlsx.utils.book_append_sheet(workbook, sheet, "Merged header");
+    const buffer = xlsx.write(workbook, { type: "array", bookType: "xlsx" }) as ArrayBuffer;
+    const container = document.createElement("div");
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: buffer,
+      fileName: "merged-header.xlsx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector(".ofv-workbook-table")));
+
+    const table = container.querySelector<HTMLTableElement>(".ofv-workbook-table")!;
+    const mergedHeader = container.querySelector<HTMLTableCellElement>('[data-cell="A1"]')!;
+    const secondRowHandles = container.querySelectorAll("tr:nth-of-type(2) .ofv-column-resize-handle");
+    expect(mergedHeader.colSpan).toBe(17);
+    expect(mergedHeader.querySelector(".ofv-column-resize-handle")).toBeNull();
+    expect(secondRowHandles).toHaveLength(17);
+
+    const columnB = container.querySelector<HTMLTableCellElement>('[data-cell="B2"]')!;
+    const handle = columnB.querySelector<HTMLElement>(".ofv-column-resize-handle")!;
+    columnB.getBoundingClientRect = () =>
+      ({ width: 100, height: 24, top: 0, right: 100, bottom: 24, left: 0, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    handle.setPointerCapture = vi.fn();
+
+    handle.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, clientX: 100, pointerId: 1 }));
+    handle.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: 160, pointerId: 1 }));
+
+    await waitFor(() => container.querySelector<HTMLTableColElement>('col[data-column-index="1"]')?.style.width === "160px");
+
+    expect(container.querySelector<HTMLTableColElement>('col[data-column-index="1"]')?.style.width).toBe("160px");
+    const renderedTableWidth = Array.from(table.querySelectorAll<HTMLTableColElement>("col")).reduce(
+      (sum, column) => sum + Number.parseFloat(column.style.width),
+      0
+    );
+    expect(table.style.width).toBe(`${renderedTableWidth}px`);
   });
 
   it("decodes GBK CSV files before rendering sheet cells", async () => {
@@ -2181,6 +2229,7 @@ describe("officePlugin", () => {
     expect(summary?.dataset.animationCount).toBe("1");
     expect(container.querySelector(".ofv-presentation-slides")).toBeNull();
     expect(container.querySelector(".ofv-pptx-viewer")?.textContent).toContain("PPTX rendered");
+    expect(container.querySelector<HTMLElement>(".ofv-pptx-viewer")?.style.lineHeight).toBe("1");
     expect(visibleText(container)).not.toContain("PPTX 演示文稿结构");
     expect(container.querySelector<HTMLElement>(".pptx-rendered")?.style.backgroundColor).toBe("rgb(32, 33, 36)");
     expect(container.querySelector<HTMLElement>(".pptx-mirrored-text-group > div")?.style.transform).toBe("scaleX(-1)");

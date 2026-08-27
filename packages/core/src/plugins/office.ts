@@ -4367,6 +4367,7 @@ function createWorkbookSheetTable(
   const rowStart = range.s.r + viewport.rowStart;
   const mergePlan = createSheetMergePlan(sheet["!merges"] || [], rowStart, rowEnd, columnStart, columnEnd);
   const imagesByCell = groupWorkbookImagesByCell(images);
+  const resizeHandleColumns = new Set<number>();
 
   const colGroup = document.createElement("colgroup");
   let tableWidth = 0;
@@ -4442,8 +4443,11 @@ function createWorkbookSheetTable(
         cell.classList.add("ofv-cell-multiline");
       }
       appendWorkbookCellImages(cell, imagesByCell.get(`${rowIndex}:${columnIndex}`), text);
-      if (rowIndex === rowStart) {
+      // A horizontal merge hides the boundaries of all columns it spans. Put
+      // those handles on the first later row with real cells instead.
+      if (!resizeHandleColumns.has(columnIndex) && (!merge || merge.colspan === 1)) {
         appendColumnResizeHandle(cell, columnIndex, columnSizing);
+        resizeHandleColumns.add(columnIndex);
       }
       row.append(cell);
     }
@@ -5086,6 +5090,9 @@ function encodeA1(rowIndex: number, columnIndex: number): string {
 async function renderPptx(panel: HTMLElement, arrayBuffer: ArrayBuffer): Promise<void> {
   const container = document.createElement("div");
   container.className = "ofv-pptx-viewer";
+  // PPTX paragraphs without an explicit line spacing inherit the host page's
+  // line-height otherwise, which can push text into later image shapes.
+  container.style.lineHeight = "1";
   let insight: PresentationInsight | undefined;
   let zip: JSZip | undefined;
   let placeholderFontCorrections: PptxPlaceholderFontCorrection[] = [];
