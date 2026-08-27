@@ -1419,6 +1419,7 @@ async function normalizeDocxLayout(container: HTMLElement, arrayBuffer: ArrayBuf
   ]);
   normalizeDocxEastAsiaFontStyles(styleContainer, hints.eastAsiaFonts);
   normalizeDocxNumberingStyles(styleContainer);
+  repairDocxSvgTextboxes(container);
   repairDocxSvgImageAlternatives(container, svgImageAlternatives);
   repairUnexpectedDocxTableTextDirections(container, hints.hasVerticalTextDirection);
   repairDocxChartPlaceholders(container, charts);
@@ -1660,6 +1661,7 @@ type DocxLayoutHints = {
     relativeFrom: string;
     relativeToParagraph: boolean;
     wrap: string;
+    part: "document" | "header" | "footer";
   }>;
   rightTabParagraphs: Array<{
     text: string;
@@ -1681,15 +1683,23 @@ async function readDocxLayoutHints(arrayBuffer: ArrayBuffer): Promise<DocxLayout
     const footerEntries = Object.values(zip.files).filter(
       (entry) => !entry.dir && /^word\/footer\d+\.xml$/i.test(entry.name)
     );
-    const [documentXml, stylesXml, themeXml, footerXmls] = await Promise.all([
+    const headerEntries = Object.values(zip.files).filter(
+      (entry) => !entry.dir && /^word\/header\d+\.xml$/i.test(entry.name)
+    );
+    const [documentXml, stylesXml, themeXml, headerXmls, footerXmls] = await Promise.all([
       zip.file("word/document.xml")?.async("text"),
       zip.file("word/styles.xml")?.async("text"),
       themeEntry?.async("text"),
+      Promise.all(headerEntries.map((entry) => entry.async("text"))),
       Promise.all(footerEntries.map((entry) => entry.async("text")))
     ]);
     return {
       eastAsiaFonts: extractDocxEastAsiaFonts(stylesXml || "", themeXml || ""),
-      floatingPictures: documentXml ? extractFloatingPictureHints(documentXml) : [],
+      floatingPictures: [
+        ...(documentXml ? extractFloatingPictureHints(documentXml, "document") : []),
+        ...headerXmls.flatMap((xml) => extractFloatingPictureHints(xml, "header")),
+        ...footerXmls.flatMap((xml) => extractFloatingPictureHints(xml, "footer"))
+      ],
       rightTabParagraphs: documentXml ? extractDocxRightTabParagraphHints(documentXml) : [],
       pageNumberFieldResults: footerXmls.flatMap(extractDocxPageNumberFieldResults),
       complexScriptFontSizeParagraphs: documentXml ? extractDocxComplexScriptFontSizeHints(documentXml) : [],
@@ -2048,7 +2058,10 @@ function sanitizeDocxCssFontFamily(fontFamily: string | undefined): string {
   return fontFamily?.replace(/["'\\,;{}()]/g, "").trim() || "";
 }
 
-function extractFloatingPictureHints(xml: string): DocxLayoutHints["floatingPictures"] {
+function extractFloatingPictureHints(
+  xml: string,
+  part: DocxLayoutHints["floatingPictures"][number]["part"] = "document"
+): DocxLayoutHints["floatingPictures"] {
   return [...xml.matchAll(/<wp:anchor\b[\s\S]*?<\/wp:anchor>/g)]
     .filter((match) => /<a:graphicData\b[^>]*uri="http:\/\/schemas\.openxmlformats\.org\/drawingml\/2006\/picture"/.test(match[0]))
     .map((match) => {
@@ -2063,7 +2076,8 @@ function extractFloatingPictureHints(xml: string): DocxLayoutHints["floatingPict
         offsetYPt: emuToPt(Number(offsetY?.[2] || 0)),
         relativeFrom: offsetX?.[1] || "",
         relativeToParagraph: offsetY?.[1] === "paragraph",
-        wrap: /<wp:wrapSquare\b/.test(anchor) ? "square" : /<wp:wrapNone\b/.test(anchor) ? "none" : ""
+        wrap: /<wp:wrapSquare\b/.test(anchor) ? "square" : /<wp:wrapNone\b/.test(anchor) ? "none" : "",
+        part
       };
     })
     .filter((hint) => hint.widthPt > 0 && hint.heightPt > 0);
@@ -2071,6 +2085,14 @@ function extractFloatingPictureHints(xml: string): DocxLayoutHints["floatingPict
 
 function emuToPt(value: number): number {
   return value / 12700;
+}
+
+function repairDocxSvgTextboxes(container: HTMLElement): void {
+  for (const svg of container.querySelectorAll<SVGSVGElement>("svg")) {
+    for (const foreignObject of Array.from(svg.querySelectorAll<SVGForeignObjectElement>("image > foreignObject"))) {
+      svg.append(foreignObject);
+    }
+  }
 }
 
 function repairDocxShapeFills(page: HTMLElement): void {
@@ -2100,12 +2122,32 @@ function repairDocxShapeFills(page: HTMLElement): void {
 }
 
 function repairDocxFloatingPictures(page: HTMLElement, hints: DocxLayoutHints): void {
-  const pageHints = hints.floatingPictures.filter((item) => item.relativeFrom === "column" && item.wrap === "square");
+  const pageHints = hints.floatingPictures.filter(
+    (item) => item.part === "document" && item.relativeFrom === "column" && item.wrap === "square"
+  );
+  repairDocxFloatingPicturesInRoot(page, page, pageHints);
+  for (const part of ["header", "footer"] as const) {
+    const region = page.querySelector<HTMLElement>(part);
+    if (region) {
+      repairDocxFloatingPicturesInRoot(
+        page,
+        region,
+        hints.floatingPictures.filter(
+          (item) => item.part === part && item.relativeFrom === "column" && item.wrap === "square"
+        )
+      );
+    }
+  }
+}
+
+function repairDocxFloatingPicturesInRoot(page: HTMLElement, root: HTMLElement, pageHints: DocxLayoutHints["floatingPictures"]): void {
   if (pageHints.length === 0) {
     return;
   }
-  const images = Array.from(page.querySelectorAll<HTMLImageElement>("img")).filter(
-    (image) => image.closest<HTMLElement>("[data-ofv-docx-float-repaired='true']") === null
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>("img")).filter(
+    (image) =>
+      image.parentElement?.closest<HTMLElement>("[data-ofv-docx-float-repaired='true']") === null &&
+      (root !== page || image.closest("header, footer") === null)
   );
   if (images.length === 0 || images.length !== pageHints.length) {
     return;

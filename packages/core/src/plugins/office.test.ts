@@ -2076,6 +2076,122 @@ describe("officePlugin", () => {
     expect(imageWrapper.style.width).toBe("68pt");
   });
 
+  it("moves DOCX VML textboxes out of SVG image nodes for browser rendering", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", "0");
+      svg.setAttribute("height", "0");
+      svg.style.width = "200pt";
+      svg.style.height = "40pt";
+      const image = document.createElementNS("http://www.w3.org/2000/svg", "image");
+      image.setAttribute("width", "100%");
+      image.setAttribute("height", "100%");
+      const foreignObject = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
+      foreignObject.setAttribute("width", "100%");
+      foreignObject.setAttribute("height", "100%");
+      const paragraph = document.createElement("p");
+      paragraph.textContent = "VML textbox content";
+      foreignObject.append(paragraph);
+      image.append(foreignObject);
+      svg.append(image);
+      page.append(svg);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+
+    createViewer({
+      container,
+      file: await createMinimalDocx("VML textbox source"),
+      fileName: "vml-textbox.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector("svg > foreignObject")));
+
+    expect(container.querySelector("svg image > foreignObject")).toBeNull();
+    expect(container.querySelector("svg > foreignObject")?.textContent).toBe("VML textbox content");
+  });
+
+  it("repairs floating pictures in DOCX headers without mixing body images", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      page.style.width = "595.3pt";
+      page.style.padding = "72pt 90pt";
+      const header = document.createElement("header");
+      const paragraph = document.createElement("p");
+      const imageWrapper = document.createElement("div");
+      imageWrapper.style.display = "inline-block";
+      imageWrapper.style.position = "relative";
+      imageWrapper.style.width = "49.95pt";
+      imageWrapper.style.height = "31.65pt";
+      imageWrapper.style.float = "left";
+      const image = document.createElement("img");
+      image.src = "data:image/png;base64,AA==";
+      imageWrapper.append(image);
+      paragraph.append(imageWrapper);
+      header.append(paragraph);
+      page.append(header);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+    const zip = new JSZip();
+    zip.file(
+      "word/document.xml",
+      `<?xml version="1.0" encoding="UTF-8"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+          xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <w:body><w:p><w:r><w:drawing><wp:anchor>
+            <wp:positionH relativeFrom="column"><wp:posOffset>3065780</wp:posOffset></wp:positionH>
+            <wp:positionV relativeFrom="paragraph"><wp:posOffset>107315</wp:posOffset></wp:positionV>
+            <wp:extent cx="2452370" cy="4994910"/><wp:wrapSquare/>
+            <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"/></a:graphic>
+          </wp:anchor></w:drawing></w:r></w:p></w:body>
+        </w:document>`
+    );
+    zip.file(
+      "word/header1.xml",
+      `<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        <w:p><w:r><w:drawing><wp:anchor>
+          <wp:positionH relativeFrom="column"><wp:posOffset>5080</wp:posOffset></wp:positionH>
+          <wp:positionV relativeFrom="paragraph"><wp:posOffset>-194945</wp:posOffset></wp:positionV>
+          <wp:extent cx="634365" cy="401955"/><wp:wrapSquare/>
+          <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"/></a:graphic>
+        </wp:anchor></w:drawing></w:r></w:p>
+      </w:hdr>`
+    );
+
+    createViewer({
+      container,
+      file: await zip.generateAsync({
+        type: "blob",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "header-picture.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelector("header img")?.parentElement?.dataset.ofvDocxFloatRepaired === "true");
+
+    const imageWrapper = container.querySelector("header img")?.parentElement as HTMLElement;
+    expect(imageWrapper.style.position).toBe("absolute");
+    expect(imageWrapper.style.left).toBe("0.4pt");
+    expect(imageWrapper.style.width).toBe("49.95pt");
+  });
+
   it("repairs multiple DOCX floating pictures without collapsing them into one image", async () => {
     const container = document.createElement("div");
     document.body.append(container);
