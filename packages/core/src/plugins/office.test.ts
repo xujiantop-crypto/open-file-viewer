@@ -1234,6 +1234,167 @@ describe("officePlugin", () => {
     expect(scaled?.style.transformOrigin).toBe("left center");
   });
 
+  it("maps positive and negative DOCX character spacing to rendered runs in order", async () => {
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      const article = document.createElement("article");
+      for (let paragraphIndex = 0; paragraphIndex < 2; paragraphIndex += 1) {
+        const paragraph = document.createElement("p");
+        for (const text of ["AB", "CD"]) {
+          const run = document.createElement("span");
+          run.textContent = text;
+          paragraph.append(run);
+        }
+        article.append(paragraph);
+      }
+      page.append(article);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+    const zip = new JSZip();
+    zip.file(
+      "word/document.xml",
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/></w:pPr>
+          <w:r><w:rPr><w:spacing w:val="20"/></w:rPr><w:t>AB</w:t></w:r>
+          <w:r><w:rPr><w:spacing w:val="-10"/></w:rPr><w:t>CD</w:t></w:r>
+        </w:p>
+        <w:p><w:pPr><w:spacing w:line="360" w:lineRule="auto"/></w:pPr>
+          <w:r><w:rPr><w:spacing w:val="5"/></w:rPr><w:t>AB</w:t></w:r>
+          <w:r><w:t>CD</w:t></w:r>
+        </w:p>
+      </w:body></w:document>`
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    createViewer({
+      container,
+      file: await zip.generateAsync({
+        type: "blob",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "character-spacing.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelectorAll("[data-ofv-docx-auto-line-height='true']").length === 2);
+
+    const paragraphs = Array.from(container.querySelectorAll<HTMLParagraphElement>("section.ofv-docx article p"));
+    const firstRuns = paragraphs[0]?.querySelectorAll<HTMLElement>(":scope > span");
+    const secondRuns = paragraphs[1]?.querySelectorAll<HTMLElement>(":scope > span");
+    expect(firstRuns?.[0]?.style.letterSpacing).toBe("1pt");
+    expect(firstRuns?.[1]?.style.letterSpacing).toBe("-0.5pt");
+    expect(secondRuns?.[0]?.style.letterSpacing).toBe("0.25pt");
+    expect(secondRuns?.[1]?.style.letterSpacing).toBe("");
+    expect(paragraphs[0]?.style.lineHeight).toBe("1.6375");
+    expect(paragraphs[1]?.style.lineHeight).toBe("1.965");
+  });
+
+  it("repaginates DOCX flow after restoring Word automatic line spacing without losing text", async () => {
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      page.style.width = "600px";
+      page.style.height = "100px";
+      page.style.padding = "10px";
+      const article = document.createElement("article");
+      for (const text of ["First paragraph", "Second paragraph"]) {
+        const paragraph = document.createElement("p");
+        paragraph.style.lineHeight = "1.25";
+        const run = document.createElement("span");
+        run.style.fontSize = "16px";
+        run.textContent = text;
+        paragraph.append(run);
+        paragraph.getBoundingClientRect = () => {
+          const siblings = Array.from(paragraph.parentElement?.children || []) as HTMLParagraphElement[];
+          const height = Number.parseFloat(paragraph.style.lineHeight) * 30;
+          const top = siblings.slice(0, siblings.indexOf(paragraph)).reduce(
+            (sum, sibling) => sum + Number.parseFloat(sibling.style.lineHeight) * 30,
+            0
+          );
+          return { x: 10, y: top, top, right: 590, bottom: top + height, left: 10, width: 580, height, toJSON: () => ({}) };
+        };
+        article.append(paragraph);
+      }
+      page.append(article);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+    const zip = new JSZip();
+    zip.file(
+      "word/document.xml",
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/></w:pPr><w:r><w:t>First paragraph</w:t></w:r></w:p>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/></w:pPr><w:r><w:t>Second paragraph</w:t></w:r></w:p>
+      </w:body></w:document>`
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    createViewer({
+      container,
+      file: await zip.generateAsync({
+        type: "blob",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "automatic-line-spacing.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelectorAll("section.ofv-docx").length === 2);
+
+    const pages = Array.from(container.querySelectorAll<HTMLElement>("section.ofv-docx"));
+    expect(pages.map((page) => page.querySelector("article")?.textContent)).toEqual(["First paragraph", "Second paragraph"]);
+    expect(pages[1]?.dataset.ofvDocxFlowContinuation).toBe("true");
+  });
+
+  it("uses Word's taller automatic line box for DOCX table-cell paragraphs", async () => {
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      const article = document.createElement("article");
+      const bodyParagraph = document.createElement("p");
+      bodyParagraph.textContent = "Body";
+      const table = document.createElement("table");
+      const cellParagraph = table.insertRow().insertCell().appendChild(document.createElement("p"));
+      cellParagraph.textContent = "Cell";
+      article.append(bodyParagraph, table);
+      page.append(article);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+    const zip = new JSZip();
+    zip.file(
+      "word/document.xml",
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/></w:pPr><w:r><w:t>Body</w:t></w:r></w:p>
+        <w:tbl><w:tr><w:tc><w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/></w:pPr><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+      </w:body></w:document>`
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    createViewer({
+      container,
+      file: await zip.generateAsync({
+        type: "blob",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "table-automatic-line-spacing.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelectorAll("[data-ofv-docx-auto-line-height='true']").length === 2);
+
+    expect(container.querySelector<HTMLParagraphElement>("article > p")?.style.lineHeight).toBe("1.6375");
+    expect(container.querySelector<HTMLParagraphElement>("td > p")?.style.lineHeight).toBe("2");
+  });
+
   it("aligns right-tab DOCX text to the OOXML tab position", async () => {
     renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
       const wrapper = document.createElement("div");
@@ -1568,7 +1729,7 @@ describe("officePlugin", () => {
     document.body.append(container);
     createViewer({
       container,
-      file: await createMinimalDocx(),
+      file: await createMinimalDocx("Cover"),
       fileName: "closing-date-empty-continuation.docx",
       plugins: [officePlugin()]
     });
@@ -1606,7 +1767,7 @@ describe("officePlugin", () => {
     document.body.append(container);
     createViewer({
       container,
-      file: await createMinimalDocx(),
+      file: await createMinimalDocx("Cover"),
       fileName: "closing-date-nonempty-continuation.docx",
       plugins: [officePlugin()]
     });
@@ -1816,6 +1977,126 @@ describe("officePlugin", () => {
     expect(continuationTable?.dataset.ofvDocxTableContinuation).toBe("true");
     expect(pages[1]?.querySelector("header")?.textContent).toBe("Repeated header");
     expect(pages[1]?.querySelectorAll("article p")).toHaveLength(0);
+  });
+
+  it("splits a DOCX table through a long rowspan without leaving an empty source page", async () => {
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      page.style.width = "600px";
+      page.style.height = "260px";
+      page.style.padding = "20px";
+      const article = document.createElement("article");
+      const leadingEmpty = document.createElement("p");
+      const table = document.createElement("table");
+      for (let index = 0; index < 5; index += 1) {
+        const row = table.insertRow();
+        const value = row.insertCell();
+        value.textContent = `Row ${index + 1}`;
+        if (index === 0) {
+          const merged = row.insertCell();
+          merged.textContent = "Merged label";
+          merged.rowSpan = 5;
+        }
+        row.getBoundingClientRect = () => {
+          const currentTable = row.closest("table")!;
+          const rowIndex = Array.from(currentTable.rows).indexOf(row);
+          const top = 40 + rowIndex * 60;
+          return { x: 20, y: top, top, right: 580, bottom: top + 60, left: 20, width: 560, height: 60, toJSON: () => ({}) };
+        };
+      }
+      table.getBoundingClientRect = () => ({
+        x: 20, y: 40, top: 40, right: 580, bottom: 340, left: 20, width: 560, height: 300, toJSON: () => ({})
+      });
+      article.append(leadingEmpty, table);
+      page.append(article);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+
+    const container = document.createElement("div");
+    document.body.append(container);
+    createViewer({
+      container,
+      file: new Blob(["docx"], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }),
+      fileName: "long-rowspan.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelectorAll("section.ofv-docx").length === 2);
+
+    const pages = Array.from(container.querySelectorAll<HTMLElement>("section.ofv-docx"));
+    const firstTable = pages[0]?.querySelector<HTMLTableElement>("article table");
+    const continuationTable = pages[1]?.querySelector<HTMLTableElement>("article table");
+    expect(Array.from(firstTable?.rows || []).map((row) => row.cells[0]?.textContent)).toEqual(["Row 1", "Row 2", "Row 3"]);
+    expect(Array.from(continuationTable?.rows || []).map((row) => row.cells[0]?.textContent)).toEqual(["Row 4", "Row 5"]);
+    expect(firstTable?.rows[0]?.cells[1]?.rowSpan).toBe(3);
+    expect(continuationTable?.rows[0]?.cells[1]?.rowSpan).toBe(2);
+    expect(continuationTable?.rows[0]?.cells[1]?.dataset.ofvDocxRowspanContinuation).toBe("true");
+    expect(continuationTable?.rows[0]?.cells[1]?.textContent).toBe("");
+    expect(pages[0]?.querySelector("article table")).not.toBeNull();
+  });
+
+  it("moves a closing signature group with its DOCX section break", async () => {
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      page.style.width = "600px";
+      page.style.height = "180px";
+      page.style.padding = "20px";
+      const article = document.createElement("article");
+      for (const text of ["Body", "", "First signature", "Second signature", "2 0 2 5 年 7 月 7 日", ""]) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = text;
+        article.append(paragraph);
+      }
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        if (this.tagName !== "P") {
+          return { x: 0, y: 0, top: 0, right: 600, bottom: 0, left: 0, width: 600, height: 0, toJSON: () => ({}) };
+        }
+        const siblings = Array.from(this.parentElement?.children || []);
+        const index = siblings.indexOf(this);
+        const top = index * 30;
+        return { x: 20, y: top, top, right: 580, bottom: top + 30, left: 20, width: 560, height: 30, toJSON: () => ({}) };
+      });
+      page.append(article);
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+    const zip = new JSZip();
+    zip.file(
+      "word/document.xml",
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t>Body</w:t></w:r></w:p><w:p/>
+        <w:p><w:r><w:t>First signature</w:t></w:r></w:p>
+        <w:p><w:r><w:t>Second signature</w:t></w:r></w:p>
+        <w:p><w:r><w:t>2 0 2 5 年 7 月 7 日</w:t></w:r></w:p>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="auto"/><w:sectPr/><w:rPr><w:sz w:val="24"/></w:rPr></w:pPr></w:p>
+        <w:sectPr/>
+      </w:body></w:document>`
+    );
+    const container = document.createElement("div");
+    document.body.append(container);
+    createViewer({
+      container,
+      file: await zip.generateAsync({
+        type: "blob",
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "section-closing.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => container.querySelectorAll("section.ofv-docx").length === 2);
+
+    const pages = Array.from(container.querySelectorAll<HTMLElement>("section.ofv-docx"));
+    expect(pages[0]?.querySelector("article")?.textContent).toBe("Body");
+    expect(pages[1]?.querySelector("article")?.textContent).toBe("First signatureSecond signature2 0 2 5 年 7 月 7 日");
+    expect(pages[1]?.querySelector("[data-ofv-docx-section-break='true']")).not.toBeNull();
   });
 
   it("keeps DOCX page width stable inside narrow containers", async () => {
