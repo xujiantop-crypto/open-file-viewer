@@ -391,6 +391,26 @@ createViewer({
   container: "#viewer",
   file,
   toolbar: {
+    zoom: true,
+    rotate: true,
+    download: false,
+    fullscreen: true,
+    print: false,
+    search: true
+  },
+  plugins
+});
+```
+
+Setting `download` or `print` to `false` removes that built-in button from the DOM, so an application can render its own permission-controlled actions outside the viewer. When passing an options object, explicitly enable the other built-in controls you want to keep.
+
+For labels, ordering, icons, and custom business actions, use the same toolbar options object:
+
+```ts
+createViewer({
+  container: "#viewer",
+  file,
+  toolbar: {
     labels: {
       download: "Download",
       fullscreen: "Fullscreen",
