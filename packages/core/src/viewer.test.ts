@@ -255,6 +255,97 @@ describe("createViewer", () => {
     viewer.destroy();
   });
 
+  it("dispatches Ctrl or Command wheel gestures through the active preview zoom commands", async () => {
+    const container = document.createElement("div");
+    const command = vi.fn();
+    document.body.append(container);
+
+    const viewer = createViewer({
+      container,
+      file: new Blob(["gesture"], { type: "text/plain" }),
+      fileName: "gesture.txt",
+      plugins: [
+        {
+          name: "gesture-zoom",
+          match: () => true,
+          render(ctx) {
+            ctx.viewport.append(document.createElement("div"));
+            return {
+              canCommand: (nextCommand) => nextCommand === "zoom-in" || nextCommand === "zoom-out",
+              command,
+              destroy: vi.fn()
+            };
+          }
+        }
+      ]
+    });
+
+    await waitFor(() => Boolean(container.querySelector(".ofv-viewport > div")));
+    const viewport = container.querySelector<HTMLElement>(".ofv-viewport")!;
+    const ordinaryWheel = new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true });
+    viewport.dispatchEvent(ordinaryWheel);
+    expect(ordinaryWheel.defaultPrevented).toBe(false);
+    expect(command).not.toHaveBeenCalled();
+
+    const zoomIn = new WheelEvent("wheel", { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true });
+    viewport.dispatchEvent(zoomIn);
+    const zoomOut = new WheelEvent("wheel", { deltaY: 100, metaKey: true, bubbles: true, cancelable: true });
+    viewport.dispatchEvent(zoomOut);
+    expect(zoomIn.defaultPrevented).toBe(true);
+    expect(zoomOut.defaultPrevented).toBe(true);
+    expect(command.mock.calls.map(([nextCommand]) => nextCommand)).toEqual(["zoom-in", "zoom-out"]);
+
+    const handledByPreview = new WheelEvent("wheel", { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true });
+    viewport.firstElementChild?.addEventListener("wheel", (event) => event.preventDefault(), { once: true });
+    viewport.firstElementChild?.dispatchEvent(handledByPreview);
+    expect(command).toHaveBeenCalledTimes(2);
+
+    viewer.destroy();
+    viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true }));
+    expect(command).toHaveBeenCalledTimes(2);
+  });
+
+  it("dispatches two-finger pinch gestures without requiring the toolbar", async () => {
+    const container = document.createElement("div");
+    const command = vi.fn();
+    document.body.append(container);
+
+    const viewer = createViewer({
+      container,
+      file: new Blob(["pinch"], { type: "text/plain" }),
+      fileName: "pinch.txt",
+      plugins: [
+        {
+          name: "pinch-zoom",
+          match: () => true,
+          render(ctx) {
+            ctx.viewport.textContent = "ready";
+            return {
+              canCommand: (nextCommand) => nextCommand === "zoom-in" || nextCommand === "zoom-out",
+              command,
+              destroy: vi.fn()
+            };
+          }
+        }
+      ]
+    });
+
+    await waitFor(() => container.querySelector(".ofv-viewport")?.textContent === "ready");
+    const viewport = container.querySelector<HTMLElement>(".ofv-viewport")!;
+    viewport.dispatchEvent(createTouchEvent("touchstart", [[0, 0], [100, 0]]));
+    const pinchOut = createTouchEvent("touchmove", [[0, 0], [112, 0]]);
+    viewport.dispatchEvent(pinchOut);
+    const pinchIn = createTouchEvent("touchmove", [[0, 0], [90, 0]]);
+    viewport.dispatchEvent(pinchIn);
+
+    expect(pinchOut.defaultPrevented).toBe(true);
+    expect(pinchIn.defaultPrevented).toBe(true);
+    expect(command.mock.calls.map(([nextCommand]) => nextCommand)).toEqual(["zoom-in", "zoom-out"]);
+
+    viewport.dispatchEvent(createTouchEvent("touchend", []));
+    viewer.destroy();
+  });
+
   it("passes a normalized initial zoom to plugins", async () => {
     const container = document.createElement("div");
     document.body.append(container);
@@ -1539,6 +1630,18 @@ describe("createViewer", () => {
     expect(removeEventListener).toHaveBeenCalledWith("fullscreenchange", expect.any(Function));
   });
 });
+
+function createTouchEvent(type: string, points: Array<[number, number]>): TouchEvent {
+  const values = points.map(([clientX, clientY]) => ({ clientX, clientY })) as Touch[];
+  const touches = Object.assign(values, {
+    item(index: number) {
+      return values[index] ?? null;
+    }
+  }) as unknown as TouchList;
+  const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+  Object.defineProperty(event, "touches", { value: touches });
+  return event;
+}
 
 async function waitFor(predicate: () => boolean, timeout = 1000): Promise<void> {
   const start = Date.now();
