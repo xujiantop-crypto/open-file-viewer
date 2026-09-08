@@ -1425,6 +1425,7 @@ async function normalizeDocxLayout(container: HTMLElement, arrayBuffer: ArrayBuf
   ]);
   normalizeDocxEastAsiaFontStyles(styleContainer, hints.eastAsiaFonts);
   normalizeDocxNumberingStyles(styleContainer);
+  repairDocxDefaultPageMargins(container, hints.needsDefaultPageMargins);
   repairDocxSvgImageAlternatives(container, svgImageAlternatives);
   repairUnexpectedDocxTableTextDirections(container, hints.hasVerticalTextDirection);
   repairDocxFloatingShapeTextboxes(container, hints.floatingShapes);
@@ -1728,6 +1729,7 @@ type DocxLayoutHints = {
     text: string;
     scalePercent: number;
   }>;
+  needsDefaultPageMargins: boolean;
   hasVerticalTextDirection: boolean;
 };
 
@@ -1757,6 +1759,7 @@ async function readDocxLayoutHints(arrayBuffer: ArrayBuffer): Promise<DocxLayout
       pageNumberFieldResults: footerXmls.flatMap(extractDocxPageNumberFieldResults),
       complexScriptFontSizeParagraphs: documentXml ? extractDocxComplexScriptFontSizeHints(documentXml) : [],
       characterScaleParagraphs: documentXml ? extractDocxCharacterScaleHints(documentXml) : [],
+      needsDefaultPageMargins: Boolean(documentXml && /<w:sectPr\b/.test(documentXml) && !/<w:pgMar\b/.test(documentXml)),
       hasVerticalTextDirection: Boolean(documentXml && /<w:textDirection\b/.test(documentXml))
     };
   } catch {
@@ -1768,8 +1771,20 @@ async function readDocxLayoutHints(arrayBuffer: ArrayBuffer): Promise<DocxLayout
       pageNumberFieldResults: [],
       complexScriptFontSizeParagraphs: [],
       characterScaleParagraphs: [],
+      needsDefaultPageMargins: false,
       hasVerticalTextDirection: false
     };
+  }
+}
+
+function repairDocxDefaultPageMargins(container: HTMLElement, needsDefaultPageMargins: boolean): void {
+  if (!needsDefaultPageMargins) {
+    return;
+  }
+  for (const page of container.querySelectorAll<HTMLElement>("section.ofv-docx")) {
+    if (!page.style.padding && !page.style.paddingTop && !page.style.paddingRight && !page.style.paddingBottom && !page.style.paddingLeft) {
+      page.style.padding = "72pt 90pt";
+    }
   }
 }
 
@@ -5809,8 +5824,11 @@ async function renderPptx(panel: HTMLElement, arrayBuffer: ArrayBuffer): Promise
   container.className = "ofv-pptx-viewer";
   let insight: PresentationInsight | undefined;
   let zip: JSZip | undefined;
+  let renderBuffer = arrayBuffer;
   let placeholderFontCorrections: PptxPlaceholderFontCorrection[] = [];
   let autofitLineHeightCorrections: PptxAutofitLineHeightCorrection[] = [];
+  let shapeFillCorrections: PptxShapeFillCorrection[] = [];
+  let autoNumberingCorrections: PptxAutoNumberingCorrection[] = [];
 
   try {
     zip = await JSZip.loadAsync(arrayBuffer);
@@ -5830,13 +5848,29 @@ async function renderPptx(panel: HTMLElement, arrayBuffer: ArrayBuffer): Promise
     } catch (error) {
       console.warn("PPTX autofit line-height extraction failed:", error);
     }
+    try {
+      ({ shapeFillCorrections, autoNumberingCorrections } = await inspectPptxVisualCorrections(zip));
+    } catch (error) {
+      console.warn("PPTX visual correction extraction failed:", error);
+    }
+    try {
+      renderBuffer = (await convertPptxTiffImages(zip)) || arrayBuffer;
+    } catch (error) {
+      console.warn("PPTX TIFF image conversion failed:", error);
+    }
   }
 
   panel.append(container);
   try {
     const { PptxViewer } = await import("@aiden0z/pptx-renderer");
-    await withTimeout(PptxViewer.open(arrayBuffer, container), pptxRenderTimeoutMs());
-    schedulePptxLayoutNormalization(container, placeholderFontCorrections, autofitLineHeightCorrections);
+    await withTimeout(PptxViewer.open(renderBuffer, container), pptxRenderTimeoutMs());
+    schedulePptxLayoutNormalization(
+      container,
+      placeholderFontCorrections,
+      autofitLineHeightCorrections,
+      shapeFillCorrections,
+      autoNumberingCorrections
+    );
   } catch (error) {
     container.replaceChildren();
     if (insight) {
@@ -5852,6 +5886,145 @@ async function renderPptx(panel: HTMLElement, arrayBuffer: ArrayBuffer): Promise
         ? "PPTX 渲染超时，请稍后重试或转换为 PDF 后预览。"
         : "PPTX 渲染失败，请检查文件是否损坏。";
   }
+}
+
+async function convertPptxTiffImages(zip: JSZip): Promise<ArrayBuffer | undefined> {
+  const tiffEntries = Object.values(zip.files).filter(
+    (entry) => !entry.dir && /^ppt\/media\/.+\.tiff?$/i.test(entry.name)
+  );
+  if (tiffEntries.length === 0) {
+    return undefined;
+  }
+
+  const UTIF = await import("utif");
+  const occupiedPaths = new Set(Object.keys(zip.files).map((path) => path.toLowerCase()));
+  const replacements = new Map<string, string>();
+
+  for (const entry of tiffEntries) {
+    const bytes = await entry.async("uint8array");
+    const sourceBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const ifd = UTIF.decode(sourceBuffer).find((candidate) => {
+      const width = Number(candidate.width || candidate.t256 || 0);
+      const height = Number(candidate.height || candidate.t257 || 0);
+      return width > 0 && height > 0;
+    });
+    if (!ifd) {
+      continue;
+    }
+    UTIF.decodeImage(sourceBuffer, ifd);
+    const rgba = UTIF.toRGBA8(ifd);
+    const width = Number(ifd.width || ifd.t256 || 0);
+    const height = Number(ifd.height || ifd.t257 || 0);
+    if (!(width > 0) || !(height > 0) || rgba.length < width * height * 4) {
+      continue;
+    }
+
+    const pngBytes = await encodeRgbaAsPng(rgba, width, height);
+    const pngPath = nextPptxPngPath(entry.name, occupiedPaths);
+    zip.file(pngPath, pngBytes);
+    zip.remove(entry.name);
+    occupiedPaths.add(pngPath.toLowerCase());
+    replacements.set(entry.name.split("/").pop()!.toLowerCase(), pngPath.split("/").pop()!);
+  }
+
+  if (replacements.size === 0) {
+    return undefined;
+  }
+  await rewritePptxImageRelationships(zip, replacements);
+  await ensurePptxPngContentType(zip);
+  return zip.generateAsync({ type: "arraybuffer" });
+}
+
+function nextPptxPngPath(tiffPath: string, occupiedPaths: Set<string>): string {
+  const preferred = tiffPath.replace(/\.tiff?$/i, ".png");
+  if (!occupiedPaths.has(preferred.toLowerCase())) {
+    return preferred;
+  }
+  const base = preferred.replace(/\.png$/i, "");
+  let suffix = 1;
+  while (occupiedPaths.has(`${base}-ofv-${suffix}.png`.toLowerCase())) {
+    suffix += 1;
+  }
+  return `${base}-ofv-${suffix}.png`;
+}
+
+async function encodeRgbaAsPng(rgba: Uint8Array, width: number, height: number): Promise<Uint8Array> {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Canvas 2D is unavailable for embedded TIFF conversion.");
+  }
+  const imageData = context.createImageData(width, height);
+  imageData.data.set(rgba);
+  context.putImageData(imageData, 0, 0);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) {
+        resolve(result);
+      } else {
+        reject(new Error("The embedded TIFF image could not be encoded as PNG."));
+      }
+    }, "image/png");
+  });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function rewritePptxImageRelationships(zip: JSZip, replacements: Map<string, string>): Promise<void> {
+  const relationshipEntries = Object.values(zip.files).filter(
+    (entry) => !entry.dir && entry.name.toLowerCase().endsWith(".rels")
+  );
+  for (const entry of relationshipEntries) {
+    const xml = await entry.async("text");
+    const document = parseOfficeXml(xml);
+    if (!document) {
+      continue;
+    }
+    let changed = false;
+    for (const relationship of Array.from(document.getElementsByTagName("*"))) {
+      if (relationship.localName !== "Relationship") {
+        continue;
+      }
+      const target = relationship.getAttribute("Target") || "";
+      const segments = target.split("/");
+      const replacement = replacements.get((segments.at(-1) || "").toLowerCase());
+      if (!replacement) {
+        continue;
+      }
+      segments[segments.length - 1] = replacement;
+      relationship.setAttribute("Target", segments.join("/"));
+      changed = true;
+    }
+    if (changed) {
+      zip.file(entry.name, new XMLSerializer().serializeToString(document));
+    }
+  }
+}
+
+async function ensurePptxPngContentType(zip: JSZip): Promise<void> {
+  const entry = Object.values(zip.files).find(
+    (candidate) => !candidate.dir && candidate.name.toLowerCase() === "[content_types].xml"
+  );
+  if (!entry) {
+    return;
+  }
+  const document = parseOfficeXml(await entry.async("text"));
+  const root = document?.documentElement;
+  if (!document || !root) {
+    return;
+  }
+  const hasPng = Array.from(root.children).some(
+    (element) => element.localName === "Default" && element.getAttribute("Extension")?.toLowerCase() === "png"
+  );
+  if (hasPng) {
+    return;
+  }
+  const defaultType = document.createElementNS(root.namespaceURI, "Default");
+  defaultType.setAttribute("Extension", "png");
+  defaultType.setAttribute("ContentType", "image/png");
+  root.append(defaultType);
+  zip.file(entry.name, new XMLSerializer().serializeToString(document));
 }
 
 function renderPptxTextFallback(container: HTMLElement, insight: PresentationInsight): void {
@@ -5911,10 +6084,23 @@ type PptxAutofitLineHeightCorrection = PptxShapeGeometry & {
   paragraphs: string[];
 };
 
+type PptxShapeFillCorrection = PptxShapeGeometry & {
+  color: string;
+};
+
+type PptxAutoNumberingCorrection = PptxShapeGeometry & {
+  items: Array<{
+    label: string;
+    text: string;
+  }>;
+};
+
 function normalizePptxLayout(
   container: HTMLElement,
   placeholderFontCorrections: PptxPlaceholderFontCorrection[],
-  autofitLineHeightCorrections: PptxAutofitLineHeightCorrection[]
+  autofitLineHeightCorrections: PptxAutofitLineHeightCorrection[],
+  shapeFillCorrections: PptxShapeFillCorrection[],
+  autoNumberingCorrections: PptxAutoNumberingCorrection[]
 ): void {
   const slideCanvases = findPptxSlideCanvases(container);
   for (const slide of slideCanvases) {
@@ -5924,6 +6110,8 @@ function normalizePptxLayout(
   }
   normalizePptxPlaceholderFonts(container, placeholderFontCorrections);
   normalizePptxAutofitLineHeights(container, autofitLineHeightCorrections);
+  normalizePptxShapeFills(container, shapeFillCorrections);
+  normalizePptxAutoNumbering(container, autoNumberingCorrections);
   normalizePptxCircleCalloutText(container);
   normalizePptxDiagramCycleText(container);
   normalizePptxMirroredText(container);
@@ -5932,24 +6120,105 @@ function normalizePptxLayout(
 function schedulePptxLayoutNormalization(
   container: HTMLElement,
   placeholderFontCorrections: PptxPlaceholderFontCorrection[],
-  autofitLineHeightCorrections: PptxAutofitLineHeightCorrection[]
+  autofitLineHeightCorrections: PptxAutofitLineHeightCorrection[],
+  shapeFillCorrections: PptxShapeFillCorrection[],
+  autoNumberingCorrections: PptxAutoNumberingCorrection[]
 ): void {
-  normalizePptxLayout(container, placeholderFontCorrections, autofitLineHeightCorrections);
+  normalizePptxLayout(
+    container,
+    placeholderFontCorrections,
+    autofitLineHeightCorrections,
+    shapeFillCorrections,
+    autoNumberingCorrections
+  );
   let observer: MutationObserver | undefined;
   if (typeof MutationObserver !== "undefined") {
     observer = new MutationObserver(() =>
-      normalizePptxLayout(container, placeholderFontCorrections, autofitLineHeightCorrections)
+      normalizePptxLayout(
+        container,
+        placeholderFontCorrections,
+        autofitLineHeightCorrections,
+        shapeFillCorrections,
+        autoNumberingCorrections
+      )
     );
     observer.observe(container, { childList: true, subtree: true });
   }
   for (const delay of [0, 100, 500, 1500, 3000]) {
     window.setTimeout(() => {
       if (container.isConnected) {
-        normalizePptxLayout(container, placeholderFontCorrections, autofitLineHeightCorrections);
+        normalizePptxLayout(
+          container,
+          placeholderFontCorrections,
+          autofitLineHeightCorrections,
+          shapeFillCorrections,
+          autoNumberingCorrections
+        );
       }
     }, delay);
   }
   window.setTimeout(() => observer?.disconnect(), 5000);
+}
+
+function normalizePptxShapeFills(container: HTMLElement, corrections: PptxShapeFillCorrection[]): void {
+  for (const correction of corrections) {
+    const wrapper = container.querySelector<HTMLElement>(`div[data-slide-index="${correction.slideIndex}"]`);
+    if (!wrapper) {
+      continue;
+    }
+    const match = findPptxGeometryElement(wrapper, correction, (element) => Boolean(element.querySelector("svg path")));
+    if (!match) {
+      continue;
+    }
+    const emptyPaths = Array.from(match.querySelectorAll<SVGPathElement>("svg path")).filter((path) => {
+      const fill = path.getAttribute("fill")?.trim().toLowerCase();
+      return !fill || fill === "none" || fill === "transparent";
+    });
+    if (emptyPaths.length === 0) {
+      continue;
+    }
+    for (const path of emptyPaths) {
+      path.setAttribute("fill", correction.color);
+    }
+    match.dataset.ofvPptxShapeFill = correction.color;
+  }
+}
+
+function normalizePptxAutoNumbering(container: HTMLElement, corrections: PptxAutoNumberingCorrection[]): void {
+  for (const correction of corrections) {
+    const wrapper = container.querySelector<HTMLElement>(`div[data-slide-index="${correction.slideIndex}"]`);
+    const match = wrapper ? findPptxShapeElement(wrapper, correction) : undefined;
+    if (!match) {
+      continue;
+    }
+    const paragraphs = Array.from(match.querySelectorAll<HTMLElement>("div")).filter((element) => {
+      const children = Array.from(element.children);
+      return children.length > 1 && children.every((child) => child.tagName === "SPAN");
+    });
+    const unused = new Set(paragraphs);
+    for (const item of correction.items) {
+      const expectedText = normalizePptxParagraphText(item.text);
+      const paragraph = Array.from(unused).find((candidate) =>
+        normalizePptxParagraphText(candidate.textContent || "").endsWith(expectedText)
+      );
+      if (!paragraph) {
+        continue;
+      }
+      const firstSpan = paragraph.querySelector<HTMLElement>(":scope > span");
+      const firstText = normalizePptxParagraphText(firstSpan?.textContent || "");
+      if (
+        !firstSpan ||
+        !firstText ||
+        expectedText.startsWith(firstText) ||
+        firstSpan.dataset.ofvPptxAutoNumber === item.label
+      ) {
+        continue;
+      }
+      firstSpan.textContent = `${item.label} `;
+      firstSpan.dataset.ofvPptxAutoNumber = item.label;
+      unused.delete(paragraph);
+    }
+  }
 }
 
 function normalizePptxCircleCalloutText(container: HTMLElement): void {
@@ -6251,6 +6520,173 @@ async function inspectPptxAutofitLineHeightCorrections(
   return corrections;
 }
 
+async function inspectPptxVisualCorrections(zip: JSZip): Promise<{
+  shapeFillCorrections: PptxShapeFillCorrection[];
+  autoNumberingCorrections: PptxAutoNumberingCorrection[];
+}> {
+  const presentationXml = await zip.file("ppt/presentation.xml")?.async("text");
+  const presentation = presentationXml ? parseOfficeXml(presentationXml) : undefined;
+  const slideSize = presentation
+    ? Array.from(presentation.getElementsByTagName("*")).find((element) => element.localName === "sldSz")
+    : undefined;
+  const slideWidth = Number(slideSize?.getAttribute("cx"));
+  const slideHeight = Number(slideSize?.getAttribute("cy"));
+  const shapeFillCorrections: PptxShapeFillCorrection[] = [];
+  const autoNumberingCorrections: PptxAutoNumberingCorrection[] = [];
+  if (!(slideWidth > 0) || !(slideHeight > 0)) {
+    return { shapeFillCorrections, autoNumberingCorrections };
+  }
+
+  const slideEntries = Object.values(zip.files)
+    .filter((entry) => !entry.dir && /^ppt\/slides\/slide\d+\.xml$/i.test(entry.name))
+    .sort((a, b) => slideNumberFromPath(a.name) - slideNumberFromPath(b.name));
+  for (const [slideIndex, entry] of slideEntries.entries()) {
+    const slide = parseOfficeXml(await entry.async("text"));
+    if (!slide) {
+      continue;
+    }
+    const shapes = Array.from(slide.getElementsByTagName("*")).filter((element) => element.localName === "sp");
+    for (const shape of shapes) {
+      const geometry = readPptxShapeGeometry(shape, slideIndex, slideWidth, slideHeight);
+      if (!geometry) {
+        continue;
+      }
+      const shapeProperties = findPptxChild(shape, "spPr");
+      const solidFill = shapeProperties ? findPptxChild(shapeProperties, "solidFill") : undefined;
+      const rgb = solidFill ? findPptxChild(solidFill, "srgbClr")?.getAttribute("val") : undefined;
+      if (rgb && /^[0-9a-f]{6}$/i.test(rgb)) {
+        shapeFillCorrections.push({ ...geometry, color: `#${rgb.toUpperCase()}` });
+      }
+
+      const textBody = findPptxChild(shape, "txBody");
+      if (!textBody) {
+        continue;
+      }
+      const counters = new Map<string, number>();
+      const items: PptxAutoNumberingCorrection["items"] = [];
+      for (const paragraph of Array.from(textBody.children).filter((element) => element.localName === "p")) {
+        const paragraphProperties = findPptxChild(paragraph, "pPr");
+        const autoNumber = paragraphProperties ? findPptxChild(paragraphProperties, "buAutoNum") : undefined;
+        const type = autoNumber?.getAttribute("type") || "";
+        const text = paragraph.textContent?.trim() || "";
+        if (!autoNumber || !text) {
+          continue;
+        }
+        const level = paragraphProperties?.getAttribute("lvl") || "0";
+        const key = `${level}:${type}`;
+        const declaredStart = Number(autoNumber.getAttribute("startAt"));
+        const number = declaredStart > 0 ? declaredStart : counters.get(key) || 1;
+        const label = formatPptxAutoNumber(type, number);
+        counters.set(key, number + 1);
+        if (label) {
+          items.push({ label, text });
+        }
+      }
+      if (items.length > 0) {
+        autoNumberingCorrections.push({ ...geometry, items });
+      }
+    }
+  }
+  return { shapeFillCorrections, autoNumberingCorrections };
+}
+
+function readPptxShapeGeometry(
+  shape: Element,
+  slideIndex: number,
+  slideWidth: number,
+  slideHeight: number
+): PptxShapeGeometry | undefined {
+  const shapeProperties = findPptxChild(shape, "spPr");
+  const transform = shapeProperties ? findPptxChild(shapeProperties, "xfrm") : undefined;
+  const offset = transform ? findPptxChild(transform, "off") : undefined;
+  const extent = transform ? findPptxChild(transform, "ext") : undefined;
+  const left = Number(offset?.getAttribute("x"));
+  const top = Number(offset?.getAttribute("y"));
+  const width = Number(extent?.getAttribute("cx"));
+  const height = Number(extent?.getAttribute("cy"));
+  if (![left, top, width, height].every((value) => Number.isFinite(value)) || width <= 0 || height <= 0) {
+    return undefined;
+  }
+  return {
+    slideIndex,
+    leftRatio: left / slideWidth,
+    topRatio: top / slideHeight,
+    widthRatio: width / slideWidth,
+    heightRatio: height / slideHeight
+  };
+}
+
+function formatPptxAutoNumber(type: string, value: number): string | undefined {
+  let label: string;
+  if (type.startsWith("arabic")) {
+    label = String(value);
+  } else if (type.startsWith("romanUc")) {
+    label = toRomanNumeral(value);
+  } else if (type.startsWith("romanLc")) {
+    label = toRomanNumeral(value).toLowerCase();
+  } else if (type.startsWith("alphaUc")) {
+    label = toAlphabeticNumeral(value);
+  } else if (type.startsWith("alphaLc")) {
+    label = toAlphabeticNumeral(value).toLowerCase();
+  } else {
+    return undefined;
+  }
+  if (type.endsWith("ParenBoth")) {
+    return `(${label})`;
+  }
+  if (type.endsWith("ParenR")) {
+    return `${label})`;
+  }
+  if (type.endsWith("Plain")) {
+    return label;
+  }
+  return `${label}.`;
+}
+
+function toRomanNumeral(value: number): string {
+  if (value <= 0 || value >= 4000) {
+    return String(value);
+  }
+  const numerals: Array<[number, string]> = [
+    [1000, "M"],
+    [900, "CM"],
+    [500, "D"],
+    [400, "CD"],
+    [100, "C"],
+    [90, "XC"],
+    [50, "L"],
+    [40, "XL"],
+    [10, "X"],
+    [9, "IX"],
+    [5, "V"],
+    [4, "IV"],
+    [1, "I"]
+  ];
+  let remainder = value;
+  let result = "";
+  for (const [amount, numeral] of numerals) {
+    while (remainder >= amount) {
+      result += numeral;
+      remainder -= amount;
+    }
+  }
+  return result;
+}
+
+function toAlphabeticNumeral(value: number): string {
+  if (value <= 0) {
+    return String(value);
+  }
+  let remainder = value;
+  let result = "";
+  while (remainder > 0) {
+    remainder -= 1;
+    result = String.fromCharCode(65 + (remainder % 26)) + result;
+    remainder = Math.floor(remainder / 26);
+  }
+  return result;
+}
+
 function readPptxLayoutPlaceholderFontSizes(layout: Document): Map<string, number> {
   const result = new Map<string, number>();
   const shapes = Array.from(layout.getElementsByTagName("*")).filter((element) => element.localName === "sp");
@@ -6354,6 +6790,14 @@ function findPptxShapeElement(
   wrapper: HTMLElement,
   correction: PptxShapeGeometry
 ): HTMLElement | undefined {
+  return findPptxGeometryElement(wrapper, correction, (element) => Boolean(element.textContent?.trim()));
+}
+
+function findPptxGeometryElement(
+  wrapper: HTMLElement,
+  correction: PptxShapeGeometry,
+  predicate: (element: HTMLElement) => boolean
+): HTMLElement | undefined {
   let best: { element: HTMLElement; score: number } | undefined;
   for (const canvas of findPptxSlideCanvases(wrapper)) {
     const canvasWidth = parseCssPixelValue(canvas.style.width);
@@ -6368,7 +6812,7 @@ function findPptxShapeElement(
       height: correction.heightRatio * canvasHeight
     };
     const candidates = Array.from(canvas.querySelectorAll<HTMLElement>("div")).filter(
-      (element) => element.style.position === "absolute" && Boolean(element.textContent?.trim())
+      (element) => element.style.position === "absolute" && predicate(element)
     );
     for (const element of candidates) {
       const actual = {

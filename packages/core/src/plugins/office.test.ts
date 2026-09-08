@@ -12,6 +12,11 @@ const shouldHangMammoth = vi.hoisted(() => ({ value: false }));
 const shouldRenderBlankDocxPreview = vi.hoisted(() => ({ value: false }));
 const docxPreviewImageSrc = vi.hoisted(() => ({ value: "" }));
 const shouldRenderVerticalDocxTable = vi.hoisted(() => ({ value: false }));
+const utifMock = vi.hoisted(() => ({
+  decode: vi.fn(),
+  decodeImage: vi.fn(),
+  toRGBA8: vi.fn()
+}));
 const renderDocxAsync = vi.hoisted(() =>
   vi.fn(async (_data: unknown, bodyContainer: HTMLElement, _styleContainer?: HTMLElement, _options?: unknown) => {
     if (shouldHangDocxPreview.value) {
@@ -196,7 +201,44 @@ const openPptx = vi.hoisted(() =>
       box.append(inner);
       diagramGroup.append(box);
     }
-    page.append(mirroredTextGroup, inheritedPlaceholder, autofitBody, circleCallout, redCircleCallout, diagramGroup);
+    const issueFillShape = document.createElement("div");
+    issueFillShape.className = "pptx-issue-fill-shape";
+    issueFillShape.style.position = "absolute";
+    issueFillShape.style.left = "64px";
+    issueFillShape.style.top = "300px";
+    issueFillShape.style.width = "32px";
+    issueFillShape.style.height = "32px";
+    const issueFillSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const issueFillPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    issueFillPath.setAttribute("fill", "none");
+    issueFillSvg.append(issueFillPath);
+    issueFillShape.append(issueFillSvg);
+    const issueNumbering = document.createElement("div");
+    issueNumbering.className = "pptx-issue-numbering";
+    issueNumbering.style.position = "absolute";
+    issueNumbering.style.left = "200px";
+    issueNumbering.style.top = "80px";
+    issueNumbering.style.width = "600px";
+    issueNumbering.style.height = "200px";
+    for (const text of ["需求背景", "交付工具", "使用介绍", "预制包标准化程度介绍"]) {
+      const paragraph = document.createElement("div");
+      const bullet = document.createElement("span");
+      bullet.textContent = "■ ";
+      const content = document.createElement("span");
+      content.textContent = text;
+      paragraph.append(bullet, content);
+      issueNumbering.append(paragraph);
+    }
+    page.append(
+      mirroredTextGroup,
+      inheritedPlaceholder,
+      autofitBody,
+      circleCallout,
+      redCircleCallout,
+      diagramGroup,
+      issueFillShape,
+      issueNumbering
+    );
     viewport.append(page);
     wrapper.append(viewport);
     container.append(wrapper);
@@ -248,6 +290,8 @@ vi.mock("@aiden0z/pptx-renderer", () => ({
   }
 }));
 
+vi.mock("utif", () => utifMock);
+
 describe("officePlugin", () => {
   afterEach(() => {
     document.body.replaceChildren();
@@ -261,6 +305,9 @@ describe("officePlugin", () => {
     docxPreviewImageSrc.value = "";
     shouldRenderVerticalDocxTable.value = false;
     pptxRenderMode.value = "normal";
+    utifMock.decode.mockReset();
+    utifMock.decodeImage.mockReset();
+    utifMock.toRGBA8.mockReset();
     delete (globalThis as { __OFV_DOCX_RENDER_TIMEOUT_MS__?: number }).__OFV_DOCX_RENDER_TIMEOUT_MS__;
     delete (globalThis as { __OFV_PPTX_RENDER_TIMEOUT_MS__?: number }).__OFV_PPTX_RENDER_TIMEOUT_MS__;
   });
@@ -1011,6 +1058,38 @@ describe("officePlugin", () => {
     expect(container.querySelector(".ofv-docx-document")?.textContent).toContain("DOCX layout page");
   });
 
+  it("restores Word default page margins when a generated DOCX omits pgMar", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: await createDocxWithSection(),
+      fileName: "generated.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector("section.ofv-docx")));
+
+    expect(container.querySelector<HTMLElement>("section.ofv-docx")?.style.padding).toBe("72pt 90pt");
+  });
+
+  it("preserves explicit zero page margins in DOCX files", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: await createDocxWithSection('<w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0"/>'),
+      fileName: "zero-margin.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector("section.ofv-docx")));
+
+    expect(container.querySelector<HTMLElement>("section.ofv-docx")?.style.padding).toBe("");
+  });
+
   it("prefers an embedded SVG alternative over its lossy DOCX fallback image", async () => {
     const container = document.createElement("div");
     const fixture = await createDocxWithSvgImageAlternative();
@@ -1568,7 +1647,7 @@ describe("officePlugin", () => {
     document.body.append(container);
     createViewer({
       container,
-      file: await createMinimalDocx(),
+      file: await createMinimalDocx(""),
       fileName: "closing-date-empty-continuation.docx",
       plugins: [officePlugin()]
     });
@@ -1606,7 +1685,7 @@ describe("officePlugin", () => {
     document.body.append(container);
     createViewer({
       container,
-      file: await createMinimalDocx(),
+      file: await createMinimalDocx(""),
       fileName: "closing-date-nonempty-continuation.docx",
       plugins: [officePlugin()]
     });
@@ -2597,6 +2676,62 @@ describe("officePlugin", () => {
     expect(circleCallouts.map((element) => element.textContent)).toEqual(["代表性\n定义", "包含的\n要素"]);
     expect(container.querySelectorAll(".pptx-circle-shape")).toHaveLength(2);
     expect(container.querySelector<HTMLElement>(".pptx-circle-shape")?.parentElement?.classList.contains("ofv-pptx-circle-callout-text")).toBe(false);
+    expect(utifMock.decode).not.toHaveBeenCalled();
+  });
+
+  it("converts embedded PPTX TIFF media to PNG before rendering", async () => {
+    const container = document.createElement("div");
+    const callsBefore = openPptx.mock.calls.length;
+    const putImageData = vi.fn();
+    utifMock.decode.mockReturnValue([{ width: 1, height: 1 }]);
+    utifMock.toRGBA8.mockReturnValue(new Uint8Array([46, 95, 250, 255]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      createImageData: () => ({ data: new Uint8ClampedArray(4) }),
+      putImageData
+    } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => {
+      callback(new Blob([toBlobPart(Uint8Array.from([137, 80, 78, 71]))], { type: "image/png" }));
+    });
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: await createPptxWithTiffImage(),
+      fileName: "embedded-tiff.pptx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => openPptx.mock.calls.length === callsBefore + 1);
+
+    const renderBuffer = openPptx.mock.calls[callsBefore]?.[0] as ArrayBuffer;
+    const renderedZip = await JSZip.loadAsync(renderBuffer);
+    expect(renderedZip.file("ppt/media/image1.tiff")).toBeNull();
+    expect(await renderedZip.file("ppt/media/image1.png")?.async("uint8array")).toEqual(Uint8Array.from([137, 80, 78, 71]));
+    expect(await renderedZip.file("ppt/slides/_rels/slide1.xml.rels")?.async("text")).toContain("../media/image1.png");
+    expect(await renderedZip.file("[Content_Types].xml")?.async("text")).toContain('Extension="png"');
+    expect(utifMock.decodeImage).toHaveBeenCalledTimes(1);
+    expect(putImageData).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores explicit PPTX shape fills and auto-numbering lost by the renderer", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: await createPptxVisualCorrectionFixture(),
+      fileName: "visual-corrections.pptx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector('[data-ofv-pptx-shape-fill="#2E5FFA"]')));
+
+    expect(container.querySelector(".pptx-issue-fill-shape path")?.getAttribute("fill")).toBe("#2E5FFA");
+    expect(
+      Array.from(container.querySelectorAll<HTMLElement>(".pptx-issue-numbering [data-ofv-pptx-auto-number]")).map(
+        (element) => element.textContent?.trim()
+      )
+    ).toEqual(["I.", "II.", "III.", "IV."]);
   });
 
   it("responds to shared toolbar zoom for PPTX previews", async () => {
@@ -3158,6 +3293,24 @@ async function createMinimalDocx(text: string, footerText?: string): Promise<Blo
           <w:p><w:r><w:t>${footerText}</w:t></w:r></w:p></w:ftr>`
     );
   }
+  return zip.generateAsync({
+    type: "blob",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  });
+}
+
+async function createDocxWithSection(pageMargins = ""): Promise<Blob> {
+  const zip = new JSZip();
+  zip.file(
+    "word/document.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+      <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        <w:body>
+          <w:p><w:r><w:t>Generated document</w:t></w:r></w:p>
+          <w:sectPr><w:pgSz w:w="11906" w:h="16838"/>${pageMargins}</w:sectPr>
+        </w:body>
+      </w:document>`
+  );
   return zip.generateAsync({
     type: "blob",
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -4380,6 +4533,79 @@ async function createMinimalPptx(): Promise<Blob> {
       </p:notes>`
   );
   zip.file("ppt/media/image1.png", "png");
+  return zip.generateAsync({
+    type: "blob",
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+  });
+}
+
+async function createPptxWithTiffImage(): Promise<Blob> {
+  const zip = new JSZip();
+  zip.file(
+    "[Content_Types].xml",
+    `<?xml version="1.0" encoding="UTF-8"?>
+      <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+        <Default Extension="xml" ContentType="application/xml"/>
+        <Default Extension="tiff" ContentType="image/tiff"/>
+      </Types>`
+  );
+  zip.file(
+    "ppt/slides/slide1.xml",
+    `<?xml version="1.0" encoding="UTF-8"?>
+      <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+        <p:cSld><p:spTree><p:pic><p:blipFill><a:blip r:embed="rIdImage"/></p:blipFill></p:pic></p:spTree></p:cSld>
+      </p:sld>`
+  );
+  zip.file(
+    "ppt/slides/_rels/slide1.xml.rels",
+    `<?xml version="1.0" encoding="UTF-8"?>
+      <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.tiff"/>
+      </Relationships>`
+  );
+  zip.file("ppt/media/image1.tiff", Uint8Array.from([73, 73, 42, 0]));
+  return zip.generateAsync({
+    type: "blob",
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+  });
+}
+
+async function createPptxVisualCorrectionFixture(): Promise<Blob> {
+  const zip = new JSZip();
+  zip.file(
+    "ppt/presentation.xml",
+    `<?xml version="1.0" encoding="UTF-8"?>
+      <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+        <p:sldSz cx="12800000" cy="7200000"/>
+      </p:presentation>`
+  );
+  zip.file(
+    "ppt/slides/slide1.xml",
+    `<?xml version="1.0" encoding="UTF-8"?>
+      <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        <p:cSld><p:spTree>
+          <p:sp>
+            <p:spPr>
+              <a:xfrm><a:off x="640000" y="3000000"/><a:ext cx="320000" cy="320000"/></a:xfrm>
+              <a:prstGeom prst="flowChartConnector"><a:avLst/></a:prstGeom>
+              <a:solidFill><a:srgbClr val="2E5FFA"/></a:solidFill>
+            </p:spPr>
+          </p:sp>
+          <p:sp>
+            <p:spPr><a:xfrm><a:off x="2000000" y="800000"/><a:ext cx="6000000" cy="2000000"/></a:xfrm></p:spPr>
+            <p:txBody><a:bodyPr/><a:lstStyle/>
+              <a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>需求背景</a:t></a:r></a:p>
+              <a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>交付工具</a:t></a:r></a:p>
+              <a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>使用介绍</a:t></a:r></a:p>
+              <a:p><a:pPr><a:buAutoNum type="romanUcPeriod"/></a:pPr><a:r><a:t>预制包标准化程度介绍</a:t></a:r></a:p>
+            </p:txBody>
+          </p:sp>
+        </p:spTree></p:cSld>
+      </p:sld>`
+  );
   return zip.generateAsync({
     type: "blob",
     mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
