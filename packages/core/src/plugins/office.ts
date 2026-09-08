@@ -1573,7 +1573,9 @@ function isDocxChartPlaceholder(element: HTMLElement): boolean {
   const position = element.style.position;
   const width = parseCssPixelValue(element.style.width);
   const height = parseCssPixelValue(element.style.height);
-  return display === "inline-block" && position === "relative" && width >= 120 && height >= 80;
+  const isInlineChart = display === "inline-block" && width >= 120;
+  const isAnchoredChart = display === "block" && element.style.width === "100%";
+  return position === "relative" && height >= 80 && (isInlineChart || isAnchoredChart);
 }
 
 function repairDocxHeadingShapeAlignment(page: HTMLElement): void {
