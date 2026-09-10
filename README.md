@@ -542,6 +542,28 @@ createViewer(options: PreviewOptions): FileViewer;
 
 `toolbar: true` enables the default toolbar, including multi-file navigation, zoom, rotate, download, fullscreen, print, and search when supported by the active plugin. You can extend it for business workflows without rewriting the whole viewer.
 
+### Hide Permission-Controlled Actions
+
+Set `download` or `print` to `false` when those actions are provided outside the viewer or gated by application permissions. When passing a toolbar options object, explicitly enable the other built-in controls you want to retain:
+
+```ts
+createViewer({
+  container: "#viewer",
+  file,
+  toolbar: {
+    zoom: true,
+    rotate: true,
+    download: permissions.canDownload,
+    fullscreen: true,
+    print: permissions.canPrint,
+    search: true
+  },
+  plugins
+});
+```
+
+Use `download: false` and `print: false` to remove both buttons completely. The viewer only controls their visibility; permission checks for controls rendered elsewhere remain the application's responsibility.
+
 ### Custom Labels, Order, and Icons
 
 ```ts
