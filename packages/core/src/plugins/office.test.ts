@@ -882,6 +882,34 @@ describe("officePlugin", () => {
     expect(container.querySelectorAll(".ofv-docx-chart-preview .ofv-chart-gridline").length).toBeGreaterThan(0);
   });
 
+  it("renders anchored DOCX chart placeholders that fill the available line width", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    renderDocxAsync.mockImplementationOnce(async (_data: unknown, bodyContainer: HTMLElement) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "ofv-docx-wrapper";
+      const page = document.createElement("section");
+      page.className = "ofv-docx";
+      page.innerHTML = `<p><span><div style="display:block;position:relative;width:100%;height:235.3pt;text-align:left"></div></span></p>`;
+      wrapper.append(page);
+      bodyContainer.append(wrapper);
+    });
+
+    createViewer({
+      container,
+      file: await createDocxWithChart(),
+      fileName: "anchored-chart.docx",
+      plugins: [officePlugin()]
+    });
+
+    await waitFor(() => Boolean(container.querySelector(".ofv-docx-chart-preview .ofv-chart-svg")));
+
+    const placeholder = container.querySelector<HTMLElement>(".ofv-docx-chart-preview");
+    expect(placeholder?.style.display).toBe("block");
+    expect(placeholder?.style.width).toBe("100%");
+    expect(placeholder?.querySelectorAll(".ofv-chart-svg rect[data-index]")).toHaveLength(3);
+  });
+
   it("preserves DOCX chart axis bounds, date labels, and mixed bar-line series", async () => {
     const container = document.createElement("div");
     document.body.append(container);
