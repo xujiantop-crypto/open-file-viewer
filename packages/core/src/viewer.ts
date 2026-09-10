@@ -114,6 +114,14 @@ export function createViewer(options: PreviewOptions): FileViewer {
   let destroyed = false;
   let renderToken = 0;
   let renderAbortController: AbortController | undefined;
+  const gestureZoom = installGestureZoom(
+    viewport,
+    (command) =>
+      !destroyed &&
+      Boolean(currentInstance?.command) &&
+      (currentInstance?.canCommand ? currentInstance.canCommand(command) : true),
+    (command) => currentInstance?.command?.(command)
+  );
 
   const setLoading = (loading: boolean) => {
     status.hidden = !loading;
@@ -245,6 +253,7 @@ export function createViewer(options: PreviewOptions): FileViewer {
       renderAbortController?.abort();
       renderAbortController = undefined;
       resizeObserver.destroy();
+      gestureZoom.destroy();
       destroyPreviewInstance(currentInstance);
       toolbar?.destroy();
       theme.destroy();
@@ -255,6 +264,99 @@ export function createViewer(options: PreviewOptions): FileViewer {
       }
     }
   };
+}
+
+function installGestureZoom(
+  viewport: HTMLElement,
+  canCommand: (command: "zoom-in" | "zoom-out") => boolean,
+  command: (command: "zoom-in" | "zoom-out") => void | boolean | undefined
+): { destroy: () => void } {
+  const wheelThreshold = 40;
+  const pinchThreshold = 1.08;
+  let accumulatedWheelDelta = 0;
+  let pinchDistance: number | undefined;
+
+  const onWheel = (event: WheelEvent) => {
+    if (event.defaultPrevented || (!event.ctrlKey && !event.metaKey) || event.deltaY === 0) {
+      return;
+    }
+    const zoomCommand = event.deltaY < 0 ? "zoom-in" : "zoom-out";
+    if (!canCommand(zoomCommand)) {
+      accumulatedWheelDelta = 0;
+      return;
+    }
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    const delta = event.deltaY * (event.deltaMode === 0 ? 1 : wheelThreshold);
+    if (accumulatedWheelDelta !== 0 && Math.sign(accumulatedWheelDelta) !== Math.sign(delta)) {
+      accumulatedWheelDelta = 0;
+    }
+    accumulatedWheelDelta += delta;
+    if (Math.abs(accumulatedWheelDelta) < wheelThreshold) {
+      return;
+    }
+    command(zoomCommand);
+    accumulatedWheelDelta = 0;
+  };
+
+  const onTouchStart = (event: TouchEvent) => {
+    pinchDistance = event.touches.length === 2 ? touchDistance(event.touches) : undefined;
+  };
+
+  const onTouchMove = (event: TouchEvent) => {
+    if (event.defaultPrevented || event.touches.length !== 2) {
+      pinchDistance = undefined;
+      return;
+    }
+    const nextDistance = touchDistance(event.touches);
+    if (!(nextDistance > 0)) {
+      return;
+    }
+    if (!(pinchDistance && pinchDistance > 0)) {
+      pinchDistance = nextDistance;
+      return;
+    }
+    const zoomCommand = nextDistance > pinchDistance ? "zoom-in" : "zoom-out";
+    if (!canCommand(zoomCommand)) {
+      return;
+    }
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    const ratio = nextDistance / pinchDistance;
+    if (ratio < pinchThreshold && ratio > 1 / pinchThreshold) {
+      return;
+    }
+    command(zoomCommand);
+    pinchDistance = nextDistance;
+  };
+
+  const onTouchEnd = (event: TouchEvent) => {
+    pinchDistance = event.touches.length === 2 ? touchDistance(event.touches) : undefined;
+  };
+
+  viewport.addEventListener("wheel", onWheel, { passive: false });
+  viewport.addEventListener("touchstart", onTouchStart, { passive: true });
+  viewport.addEventListener("touchmove", onTouchMove, { passive: false });
+  viewport.addEventListener("touchend", onTouchEnd, { passive: true });
+  viewport.addEventListener("touchcancel", onTouchEnd, { passive: true });
+
+  return {
+    destroy() {
+      viewport.removeEventListener("wheel", onWheel);
+      viewport.removeEventListener("touchstart", onTouchStart);
+      viewport.removeEventListener("touchmove", onTouchMove);
+      viewport.removeEventListener("touchend", onTouchEnd);
+      viewport.removeEventListener("touchcancel", onTouchEnd);
+    }
+  };
+}
+
+function touchDistance(touches: TouchList): number {
+  const first = touches.item(0);
+  const second = touches.item(1);
+  return first && second ? Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY) : 0;
 }
 
 function parseClassNameTokens(className: string | undefined): string[] {
