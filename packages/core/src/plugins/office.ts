@@ -1430,6 +1430,9 @@ async function normalizeDocxLayout(container: HTMLElement, arrayBuffer: ArrayBuf
   repairDocxFloatingShapeTextboxes(container, hints.floatingShapes);
   repairDocxChartPlaceholders(container, charts);
   repairDocxComplexScriptFontSizes(container, hints.complexScriptFontSizeParagraphs);
+  repairDocxCharacterSpacing(container, hints.characterSpacingParagraphs);
+  repairDocxAutoLineHeights(container, hints.autoLineHeightParagraphs);
+  markDocxSectionBreakParagraphs(container, hints.sectionBreakParagraphIndexes);
   repairDocxCharacterScaling(container, hints.characterScaleParagraphs);
   const pages = container.querySelectorAll<HTMLElement>("section.ofv-docx");
   for (const page of pages) {
@@ -1728,6 +1731,20 @@ type DocxLayoutHints = {
     text: string;
     scalePercent: number;
   }>;
+  characterSpacingParagraphs: Array<{
+    text: string;
+    runs: Array<{
+      text: string;
+      spacingPt?: number;
+    }>;
+  }>;
+  autoLineHeightParagraphs: Array<{
+    paragraphIndex: number;
+    text: string;
+    lineMultiple: number;
+    fontSizePt?: number;
+  }>;
+  sectionBreakParagraphIndexes: number[];
   hasVerticalTextDirection: boolean;
 };
 
@@ -1757,6 +1774,9 @@ async function readDocxLayoutHints(arrayBuffer: ArrayBuffer): Promise<DocxLayout
       pageNumberFieldResults: footerXmls.flatMap(extractDocxPageNumberFieldResults),
       complexScriptFontSizeParagraphs: documentXml ? extractDocxComplexScriptFontSizeHints(documentXml) : [],
       characterScaleParagraphs: documentXml ? extractDocxCharacterScaleHints(documentXml) : [],
+      characterSpacingParagraphs: documentXml ? extractDocxCharacterSpacingHints(documentXml) : [],
+      autoLineHeightParagraphs: documentXml ? extractDocxAutoLineHeightHints(documentXml) : [],
+      sectionBreakParagraphIndexes: documentXml ? extractDocxSectionBreakParagraphIndexes(documentXml) : [],
       hasVerticalTextDirection: Boolean(documentXml && /<w:textDirection\b/.test(documentXml))
     };
   } catch {
@@ -1768,6 +1788,9 @@ async function readDocxLayoutHints(arrayBuffer: ArrayBuffer): Promise<DocxLayout
       pageNumberFieldResults: [],
       complexScriptFontSizeParagraphs: [],
       characterScaleParagraphs: [],
+      characterSpacingParagraphs: [],
+      autoLineHeightParagraphs: [],
+      sectionBreakParagraphIndexes: [],
       hasVerticalTextDirection: false
     };
   }
@@ -2019,6 +2042,214 @@ function repairDocxCharacterScaling(
     }
     paragraph.style.whiteSpace = "nowrap";
     paragraph.dataset.ofvDocxCharacterScaled = "true";
+  }
+}
+
+function extractDocxCharacterSpacingHints(xml: string): DocxLayoutHints["characterSpacingParagraphs"] {
+  const document = parseOfficeXml(xml);
+  if (!document) {
+    return [];
+  }
+  return Array.from(document.getElementsByTagName("*"))
+    .filter((element) => element.localName === "p")
+    .flatMap((paragraph) => {
+      const runs: DocxLayoutHints["characterSpacingParagraphs"][number]["runs"] = Array.from(paragraph.children)
+        .filter((element) => element.localName === "r")
+        .flatMap((run) => {
+          const text = Array.from(run.getElementsByTagName("*"))
+            .filter((element) => element.localName === "t")
+            .map((element) => element.textContent || "")
+            .join("");
+          if (!text) {
+            return [];
+          }
+          const runProperties = Array.from(run.children).find((element) => element.localName === "rPr");
+          const spacing = runProperties
+            ? Array.from(runProperties.children).find((element) => element.localName === "spacing")
+            : undefined;
+          const spacingTwentieths = Number(spacing ? getXmlAttribute(spacing, "val") : Number.NaN);
+          return Number.isFinite(spacingTwentieths)
+            ? [{ text, spacingPt: spacingTwentieths / 20 }]
+            : [{ text }];
+        });
+      const text = normalizePreviewText(runs.map((run) => run.text).join(""));
+      return text && runs.some((run) => run.spacingPt !== undefined) ? [{ text, runs }] : [];
+    });
+}
+
+function repairDocxCharacterSpacing(
+  container: HTMLElement,
+  hints: DocxLayoutHints["characterSpacingParagraphs"]
+): void {
+  if (hints.length === 0) {
+    return;
+  }
+  const candidatesByText = new Map<string, HTMLParagraphElement[]>();
+  for (const paragraph of container.querySelectorAll<HTMLParagraphElement>("section.ofv-docx article p")) {
+    const text = normalizePreviewText(paragraph.textContent || "");
+    if (!text) {
+      continue;
+    }
+    const candidates = candidatesByText.get(text) || [];
+    candidates.push(paragraph);
+    candidatesByText.set(text, candidates);
+  }
+
+  for (const hint of hints) {
+    const paragraph = candidatesByText.get(hint.text)?.shift();
+    if (!paragraph) {
+      continue;
+    }
+    const renderedRuns = getRenderedDocxRuns(paragraph);
+    let renderedIndex = 0;
+    for (const run of hint.runs) {
+      while (renderedIndex < renderedRuns.length) {
+        const renderedRun = renderedRuns[renderedIndex++]!;
+        if (!docxRunTextsMatch(renderedRun.textContent || "", run.text)) {
+          continue;
+        }
+        if (run.spacingPt !== undefined) {
+          renderedRun.style.letterSpacing = `${formatCssNumber(run.spacingPt)}pt`;
+          renderedRun.dataset.ofvDocxCharacterSpacing = "true";
+        }
+        break;
+      }
+    }
+  }
+}
+
+function getRenderedDocxRuns(paragraph: HTMLParagraphElement): HTMLElement[] {
+  return Array.from(paragraph.children).flatMap((child) => {
+    if (!(child instanceof HTMLElement)) {
+      return [];
+    }
+    if (child.tagName === "SPAN") {
+      return [child];
+    }
+    return Array.from(child.querySelectorAll<HTMLElement>(":scope > span"));
+  });
+}
+
+function docxRunTextsMatch(renderedText: string, sourceText: string): boolean {
+  const normalizedSource = normalizePreviewText(sourceText);
+  return normalizedSource
+    ? normalizePreviewText(renderedText) === normalizedSource
+    : sourceText.length > 0 && /^\s+$/.test(sourceText) && /^\s+$/.test(renderedText);
+}
+
+const DOCX_WORD_SINGLE_LINE_EM = 1.31;
+const DOCX_WORD_TABLE_SINGLE_LINE_EM = 1.6;
+
+function extractDocxAutoLineHeightHints(xml: string): DocxLayoutHints["autoLineHeightParagraphs"] {
+  const document = parseOfficeXml(xml);
+  if (!document) {
+    return [];
+  }
+  return Array.from(document.getElementsByTagName("*"))
+    .filter((element) => element.localName === "p")
+    .flatMap((paragraph, paragraphIndex): DocxLayoutHints["autoLineHeightParagraphs"] => {
+      const properties = Array.from(paragraph.children).find((element) => element.localName === "pPr");
+      const spacing = properties
+        ? Array.from(properties.children).find((element) => element.localName === "spacing")
+        : undefined;
+      const runProperties = properties
+        ? Array.from(properties.children).find((element) => element.localName === "rPr")
+        : undefined;
+      const fontSize = runProperties
+        ? Array.from(runProperties.children).find((element) => element.localName === "sz")
+        : undefined;
+      const halfPointFontSize = Number(fontSize ? getXmlAttribute(fontSize, "val") : Number.NaN);
+      const line = Number(spacing ? getXmlAttribute(spacing, "line") : 0);
+      const text = normalizePreviewText(
+        Array.from(paragraph.getElementsByTagName("*"))
+          .filter((element) => element.localName === "t")
+          .map((element) => element.textContent || "")
+          .join("")
+      );
+      if (!spacing || getXmlAttribute(spacing, "lineRule") !== "auto" || !Number.isFinite(line) || line <= 0) {
+        return [];
+      }
+      return [{
+        paragraphIndex,
+        text,
+        lineMultiple: line / 240,
+        ...(Number.isFinite(halfPointFontSize) && halfPointFontSize > 0
+          ? { fontSizePt: halfPointFontSize / 2 }
+          : {})
+      }];
+    });
+}
+
+function repairDocxAutoLineHeights(
+  container: HTMLElement,
+  hints: DocxLayoutHints["autoLineHeightParagraphs"]
+): void {
+  if (hints.length === 0) {
+    return;
+  }
+  const paragraphs = Array.from(container.querySelectorAll<HTMLParagraphElement>("section.ofv-docx article p"));
+  for (const hint of hints) {
+    const paragraph = paragraphs[hint.paragraphIndex];
+    if (!paragraph || normalizePreviewText(paragraph.textContent || "") !== hint.text) {
+      continue;
+    }
+    // OOXML's auto value is measured in 240ths of Word's font line box,
+    // while a CSS unitless line-height is measured directly against 1em.
+    // Word also gives table-cell paragraphs a taller line box than body text.
+    const singleLineEm = paragraph.closest("td, th")
+      ? DOCX_WORD_TABLE_SINGLE_LINE_EM
+      : DOCX_WORD_SINGLE_LINE_EM;
+    paragraph.style.lineHeight = formatCssNumber(hint.lineMultiple * singleLineEm);
+    if (!hint.text && hint.fontSizePt) {
+      paragraph.style.fontSize = `${formatCssNumber(hint.fontSizePt)}pt`;
+      paragraph.style.minHeight = `${formatCssNumber(hint.fontSizePt * hint.lineMultiple * singleLineEm)}pt`;
+    }
+    paragraph.dataset.ofvDocxAutoLineHeight = "true";
+  }
+}
+
+function extractDocxSectionBreakParagraphIndexes(xml: string): number[] {
+  const document = parseOfficeXml(xml);
+  if (!document) {
+    return [];
+  }
+  return Array.from(document.getElementsByTagName("*"))
+    .filter((element) => element.localName === "p")
+    .flatMap((paragraph, paragraphIndex) => {
+      const properties = Array.from(paragraph.children).find((element) => element.localName === "pPr");
+      return properties && Array.from(properties.children).some((element) => element.localName === "sectPr")
+        ? [paragraphIndex]
+        : [];
+    });
+}
+
+function markDocxSectionBreakParagraphs(container: HTMLElement, paragraphIndexes: number[]): void {
+  if (paragraphIndexes.length === 0) {
+    return;
+  }
+  const sourcePages = Array.from(
+    container.querySelectorAll<HTMLElement>(".ofv-docx-wrapper > section.ofv-docx")
+  );
+  if (sourcePages.length > paragraphIndexes.length) {
+    sourcePages.slice(0, paragraphIndexes.length).forEach((page) => {
+      const article = Array.from(page.children).find(
+        (child): child is HTMLElement => child instanceof HTMLElement && child.tagName === "ARTICLE"
+      );
+      const boundary = Array.from(article?.children || [])
+        .reverse()
+        .find((child): child is HTMLParagraphElement => child instanceof HTMLParagraphElement);
+      if (boundary) {
+        boundary.dataset.ofvDocxSectionBreak = "true";
+      }
+    });
+    return;
+  }
+  const paragraphs = Array.from(container.querySelectorAll<HTMLParagraphElement>("section.ofv-docx article p"));
+  for (const paragraphIndex of paragraphIndexes) {
+    const paragraph = paragraphs[paragraphIndex];
+    if (paragraph) {
+      paragraph.dataset.ofvDocxSectionBreak = "true";
+    }
   }
 }
 
@@ -2723,6 +2954,32 @@ function paginateDocxPage(sourcePage: HTMLElement): void {
 
     let overflowBlock = block;
     while (docxBlockExceedsPage(overflowBlock, page, nominalHeight) && continuationCount < 100) {
+      if (overflowBlock.dataset.ofvDocxSectionBreak === "true") {
+        const previous = overflowBlock.previousElementSibling;
+        if (previous instanceof HTMLElement && shouldMoveDocxParagraphWhole(previous)) {
+          const trailingBlocks = [previous, overflowBlock];
+          if (looksLikeDocxClosingDateParagraph(previous)) {
+            let sibling = previous.previousElementSibling;
+            while (
+              sibling instanceof HTMLElement &&
+              sibling.tagName === "P" &&
+              !docxBlockIsVisuallyEmpty(sibling) &&
+              trailingBlocks.length < 4
+            ) {
+              trailingBlocks.unshift(sibling);
+              sibling = sibling.previousElementSibling;
+            }
+          }
+          trailingBlocks.forEach((item) => item.remove());
+          const continuation = createDocxContinuationPage(sourcePage, flowRoot);
+          page.after(continuation.page);
+          page = continuation.page;
+          pageFlow = continuation.flowRoot;
+          pageFlow.append(...trailingBlocks);
+          continuationCount += 1;
+          break;
+        }
+      }
       if (docxBlockIsVisuallyEmpty(overflowBlock)) {
         overflowBlock.remove();
         break;
@@ -2748,6 +3005,10 @@ function paginateDocxPage(sourcePage: HTMLElement): void {
   attachDocxPageBottomFrames(page, bottomFrames);
 }
 
+function looksLikeDocxClosingDateParagraph(paragraph: HTMLElement): boolean {
+  return /2\s*0\s*\d\s*\d\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日/.test(paragraph.textContent || "");
+}
+
 function repairDocxFirstPageClosingDate(container: HTMLElement): void {
   const pages = Array.from(container.querySelectorAll<HTMLElement>("section.ofv-docx"));
   const firstPage = pages[0];
@@ -2762,6 +3023,9 @@ function repairDocxFirstPageClosingDate(container: HTMLElement): void {
     return;
   }
   const sourcePage = dateParagraph.closest<HTMLElement>("section.ofv-docx");
+  if (sourcePage?.querySelector("[data-ofv-docx-section-break='true']")) {
+    return;
+  }
   const signatory = Array.from(firstPage.querySelectorAll<HTMLElement>("article p"))
     .filter((paragraph) => normalizePreviewText(paragraph.textContent || "") === "中共玉门市委办公室")
     .at(-1);
@@ -2857,18 +3121,27 @@ function splitDocxTableToFit(table: HTMLTableElement, page: HTMLElement, nominal
 
   const pageBottom = docxPageContentBottom(page, nominalHeight);
   let splitIndex = 0;
+  let lastFittingIndex = 0;
   for (let index = 1; index < rows.length; index += 1) {
     if (rows[index - 1]!.getBoundingClientRect().bottom > pageBottom) {
       break;
     }
+    lastFittingIndex = index;
     if (!docxTableBoundaryCrossesRowSpan(rows, index)) {
       splitIndex = index;
     }
+  }
+  if (lastFittingIndex > splitIndex && lastFittingIndex < rows.length) {
+    splitIndex = lastFittingIndex;
   }
   if (splitIndex <= 0 || splitIndex >= rows.length) {
     return undefined;
   }
 
+  const cellPlacements = mapDocxTableCellPlacements(rows);
+  const crossingCells = Array.from(cellPlacements.values()).filter(
+    (placement) => placement.rowIndex < splitIndex && placement.rowIndex + placement.rowSpan > splitIndex
+  );
   const continuation = table.cloneNode(false) as HTMLTableElement;
   continuation.dataset.ofvDocxTableContinuation = "true";
   continuation.removeAttribute("id");
@@ -2896,7 +3169,54 @@ function splitDocxTableToFit(table: HTMLTableElement, page: HTMLElement, nominal
       continuation.append(row);
     }
   }
+  const firstContinuationRow = rows[splitIndex];
+  if (firstContinuationRow) {
+    for (const placement of crossingCells.sort((left, right) => left.columnIndex - right.columnIndex)) {
+      placement.cell.rowSpan = splitIndex - placement.rowIndex;
+      const continuationCell = placement.cell.cloneNode(true) as HTMLTableCellElement;
+      continuationCell.replaceChildren();
+      continuationCell.removeAttribute("id");
+      continuationCell.querySelectorAll<HTMLElement>("[id]").forEach((element) => element.removeAttribute("id"));
+      continuationCell.rowSpan = placement.rowIndex + placement.rowSpan - splitIndex;
+      continuationCell.dataset.ofvDocxRowspanContinuation = "true";
+      const referenceCell = Array.from(firstContinuationRow.cells).find(
+        (cell) => (cellPlacements.get(cell)?.columnIndex ?? Number.POSITIVE_INFINITY) > placement.columnIndex
+      );
+      firstContinuationRow.insertBefore(continuationCell, referenceCell || null);
+    }
+  }
   return continuation;
+}
+
+type DocxTableCellPlacement = {
+  cell: HTMLTableCellElement;
+  rowIndex: number;
+  columnIndex: number;
+  rowSpan: number;
+};
+
+function mapDocxTableCellPlacements(rows: HTMLTableRowElement[]): Map<HTMLTableCellElement, DocxTableCellPlacement> {
+  const placements = new Map<HTMLTableCellElement, DocxTableCellPlacement>();
+  const occupiedUntil: number[] = [];
+  rows.forEach((row, rowIndex) => {
+    let columnIndex = 0;
+    for (const cell of Array.from(row.cells)) {
+      const rowSpan = Math.max(1, cell.rowSpan);
+      const columnSpan = Math.max(1, cell.colSpan);
+      while (
+        Array.from({ length: columnSpan }, (_, offset) => occupiedUntil[columnIndex + offset] || 0)
+          .some((occupiedRow) => occupiedRow > rowIndex)
+      ) {
+        columnIndex += 1;
+      }
+      placements.set(cell, { cell, rowIndex, columnIndex, rowSpan });
+      for (let column = columnIndex; column < columnIndex + columnSpan; column += 1) {
+        occupiedUntil[column] = Math.max(occupiedUntil[column] || 0, rowIndex + rowSpan);
+      }
+      columnIndex += columnSpan;
+    }
+  });
+  return placements;
 }
 
 function docxTableBoundaryCrossesRowSpan(rows: HTMLTableRowElement[], splitIndex: number): boolean {
