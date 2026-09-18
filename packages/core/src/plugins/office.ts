@@ -4761,6 +4761,7 @@ type ChartPreview = {
     labelFontSizes?: number[];
     firstSliceAngle?: number;
     holeSize?: number;
+    varyColors?: boolean;
   }>;
 };
 
@@ -4930,6 +4931,8 @@ function parseChartXml(xml: string, fallbackName: string, themeColors: Record<st
       .filter((element) => element.localName === "axId")
       .map((element) => element.getAttribute("val") || "")
       .filter(Boolean);
+    const varyColorsElement = Array.from(chartType.children).find((element) => element.localName === "varyColors");
+    const varyColors = !varyColorsElement || !["0", "false"].includes((varyColorsElement.getAttribute("val") || "1").toLowerCase());
     return Array.from(chartType.children)
       .filter((element) => element.localName === "ser")
       .map((element) => {
@@ -4947,6 +4950,7 @@ function parseChartXml(xml: string, fallbackName: string, themeColors: Record<st
           ...readCircularChartLabels(element, chartType, parsed),
           firstSliceAngle: Number(Array.from(chartType.children).find((child) => child.localName === "firstSliceAng")?.getAttribute("val") || 0),
           holeSize: Number(Array.from(chartType.children).find((child) => child.localName === "holeSize")?.getAttribute("val") || 50),
+          varyColors,
           valueAxisId: axisIds[1]
         };
       });
@@ -4981,7 +4985,8 @@ function parseChartXml(xml: string, fallbackName: string, themeColors: Record<st
       labelPositions: item.labelPositions,
       labelFontSizes: item.labelFontSizes,
       firstSliceAngle: item.firstSliceAngle,
-      holeSize: item.holeSize
+      holeSize: item.holeSize,
+      varyColors: item.varyColors
     }))
   };
 }
@@ -5350,13 +5355,43 @@ function renderCircularChart(svg: SVGSVGElement, chart: ChartPreview, colors: st
   const inner = series.type === "doughnut" ? radius * Math.max(0.1, Math.min(0.9, (series.holeSize ?? 50) / 100)) : 0;
   let angle = ((series.firstSliceAngle || 0) - 90) * Math.PI / 180;
   const point = (r: number, a: number) => `${cx + r * Math.cos(a)},${cy + r * Math.sin(a)}`;
+  if (total <= 0) {
+    appendSvg(svg, "circle", {
+      cx,
+      cy,
+      r: radius,
+      fill: "#e5e7eb",
+      stroke: "#cbd5e1",
+      "stroke-width": 1,
+      "data-empty-chart": "true"
+    });
+    if (inner > 0) {
+      appendSvg(svg, "circle", { cx, cy, r: inner, fill: "#ffffff" });
+    }
+    const empty = appendSvg(svg, "text", {
+      x: cx,
+      y: cy,
+      "text-anchor": "middle",
+      "dominant-baseline": "middle",
+      class: "ofv-chart-label ofv-chart-empty"
+    });
+    empty.textContent = "暂无有效数据";
+    return;
+  }
+  const palette = chart.palette?.length ? chart.palette : colors;
   values.forEach((value, index) => {
     const sweep = total > 0 ? value / total * Math.PI * 2 : 0;
     const end = angle + sweep;
-    const palette = chart.palette || colors;
-    const baseColor = palette[index % palette.length];
-    const cycle = Math.floor(index / palette.length);
-    const color = series.pointColors?.[index] || (cycle > 0 ? tintChartColor(baseColor, Math.min(0.8, cycle * 0.5)) : baseColor);
+    const varyColors = series.varyColors !== false;
+    const paletteIndex = varyColors ? index % palette.length : 0;
+    const baseColor = palette[paletteIndex] || colors[0];
+    const cycle = varyColors ? Math.floor(index / palette.length) : 0;
+    const automaticColor = !varyColors && series.color
+      ? series.color
+      : cycle > 0
+        ? tintChartColor(baseColor, Math.min(0.8, cycle * 0.5))
+        : baseColor;
+    const color = series.pointColors?.[index] || automaticColor;
     if (sweep > 0) {
       // Two arcs also handle a single slice covering the full circle.
       const middle = angle + sweep / 2;

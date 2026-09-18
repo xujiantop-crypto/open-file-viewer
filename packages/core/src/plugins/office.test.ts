@@ -1019,6 +1019,59 @@ describe("officePlugin", () => {
     expect(container.querySelector<SVGElement>('[data-label-index="0"]')?.style.fontSize).toBe("12px");
   });
 
+  it("uses the series fill when pie colors do not vary while preserving point overrides", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const zip = await JSZip.loadAsync(await createWorkbookWithChart("pie"));
+    const xml = (await zip.file("xl/charts/chart1.xml")!.async("text")).replace(
+      "<c:ser>",
+      '<c:varyColors val="0"/><c:ser><c:spPr><a:solidFill><a:srgbClr val="445566"/></a:solidFill></c:spPr><c:dPt><c:idx val="0"/><c:spPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></c:spPr></c:dPt>'
+    );
+    zip.file("xl/charts/chart1.xml", xml);
+
+    createViewer({ container, file: await zip.generateAsync({ type: "blob" }), fileName: "series-color.xlsx", plugins: [officePlugin()] });
+    await waitFor(() => Boolean(container.querySelector(".ofv-chart-svg")));
+
+    const fills = Array.from(container.querySelectorAll("path[data-slice-index]")).map((slice) => slice.getAttribute("fill"));
+    expect(fills).toEqual(["#FF0000", "#445566", "#445566"]);
+  });
+
+  it("shows an explicit empty state for all-zero circular charts", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const zip = await JSZip.loadAsync(await createWorkbookWithChart("pie"));
+    const xml = (await zip.file("xl/charts/chart1.xml")!.async("text"))
+      .replace("<c:v>12</c:v>", "<c:v>0</c:v>")
+      .replace("<c:v>18</c:v>", "<c:v>0</c:v>")
+      .replace("<c:v>30</c:v>", "<c:v>0</c:v>");
+    zip.file("xl/charts/chart1.xml", xml);
+
+    createViewer({ container, file: await zip.generateAsync({ type: "blob" }), fileName: "zero-pie.xlsx", plugins: [officePlugin()] });
+    await waitFor(() => Boolean(container.querySelector("[data-empty-chart]")));
+
+    expect(container.querySelectorAll("path[data-slice-index]")).toHaveLength(0);
+    expect(container.querySelector(".ofv-chart-empty")?.textContent).toBe("暂无有效数据");
+    expect(container.querySelector(".ofv-chart-svg")?.outerHTML).not.toContain("NaN");
+  });
+
+  it("keeps every circular value when category labels are shorter than the series", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const zip = await JSZip.loadAsync(await createWorkbookWithChart("pie"));
+    const xml = (await zip.file("xl/charts/chart1.xml")!.async("text"))
+      .replace('<c:pt idx="1"><c:v>Q2</c:v></c:pt>', "")
+      .replace('<c:pt idx="2"><c:v>Q3</c:v></c:pt>', "");
+    zip.file("xl/charts/chart1.xml", xml);
+
+    createViewer({ container, file: await zip.generateAsync({ type: "blob" }), fileName: "short-categories.xlsx", plugins: [officePlugin()] });
+    await waitFor(() => Boolean(container.querySelector(".ofv-chart-svg")));
+
+    expect(container.querySelectorAll("path[data-slice-index]")).toHaveLength(3);
+    expect(container.querySelector('path[data-slice-index="0"] title')?.textContent).toBe("Q1: 12 (20%)");
+    expect(container.querySelector('path[data-slice-index="1"] title')?.textContent).toBe("2: 18 (30%)");
+    expect(container.querySelector('path[data-slice-index="2"] title')?.textContent).toBe("3: 30 (50%)");
+  });
+
   it("honors small source fonts, wraps legends by width, and moves best-fit labels outside narrow slices", async () => {
     const container = document.createElement("div");
     document.body.append(container);
