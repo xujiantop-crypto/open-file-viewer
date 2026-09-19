@@ -156,10 +156,15 @@ export type OfficeConversionResult =
       mimeType?: string;
     };
 
+export type OfficeDocxRenderOptions = Omit<
+  Partial<docxPreview.Options>,
+  "className" | "inWrapper" | "breakPages"
+>;
+
 export interface OfficePluginOptions {
   convert?: (ctx: OfficeConversionContext) => Promise<OfficeConversionResult | null | undefined> | OfficeConversionResult | null | undefined;
   preferConversion?: boolean | ((ctx: OfficeConversionContext) => boolean | Promise<boolean>);
-  docx?: Partial<docxPreview.Options>;
+  docx?: OfficeDocxRenderOptions;
   pdf?: PdfPluginOptions;
 }
 
@@ -588,11 +593,23 @@ function renderWordHtmlDocument(panel: HTMLElement, html: string): void {
   panel.append(section);
 }
 
+function normalizeOfficeDocxRenderOptions(options?: OfficeDocxRenderOptions): Partial<docxPreview.Options> {
+  const safeOptions: Partial<docxPreview.Options> = { ...(options || {}) };
+  // The pagination, chart, floating-picture and fit passes below depend on
+  // docx-preview keeping these structural hooks stable. Strip them at runtime
+  // as well so untyped JavaScript callers cannot accidentally disable the
+  // layout repair pipeline.
+  delete safeOptions.className;
+  delete safeOptions.inWrapper;
+  delete safeOptions.breakPages;
+  return safeOptions;
+}
+
 async function renderDocx(
   panel: HTMLElement,
   arrayBuffer: ArrayBuffer,
   fit: PreviewFit,
-  docxOptions?: Partial<docxPreview.Options>
+  docxOptions?: OfficeDocxRenderOptions
 ): Promise<() => void> {
   panel.classList.add("ofv-office-docx");
   const content = document.createElement("div");
@@ -601,14 +618,12 @@ async function renderDocx(
   styleContainer.className = "ofv-docx-style-container";
   document.head.append(styleContainer);
   let disposeFit: (() => void) | undefined;
+  const userDocxOptions = normalizeOfficeDocxRenderOptions(docxOptions);
 
   try {
     await withTimeout(
       (async () => {
         await docxPreview.renderAsync(arrayBuffer, content, styleContainer, {
-          className: "ofv-docx",
-          inWrapper: true,
-          breakPages: true,
           ignoreWidth: false,
           ignoreHeight: false,
           ignoreFonts: false,
@@ -620,7 +635,10 @@ async function renderDocx(
           renderAltChunks: true,
           experimental: true,
           useBase64URL: true,
-          ...(docxOptions || {})
+          ...userDocxOptions,
+          className: "ofv-docx",
+          inWrapper: true,
+          breakPages: true
         });
       })(),
       docxRenderTimeoutMs(),
@@ -7985,7 +8003,7 @@ async function renderPackagedOfficePreview(
   extension: string,
   fit: PreviewFit,
   messages: PreviewMessages,
-  docxOptions?: Partial<docxPreview.Options>
+  docxOptions?: OfficeDocxRenderOptions
 ): Promise<boolean> {
   let zip: JSZip;
   try {

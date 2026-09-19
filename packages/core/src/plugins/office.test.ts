@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import JSZip from "jszip";
 import { createViewer } from "../viewer";
 import { renderLegacyWordDocument, type LegacyWordDocument } from "./msdoc";
-import { officePlugin } from "./office";
+import { officePlugin, type OfficeDocxRenderOptions } from "./office";
 
 const shouldFailDocxPreview = vi.hoisted(() => ({ value: false }));
 const shouldHangDocxPreview = vi.hoisted(() => ({ value: false }));
@@ -1197,6 +1197,57 @@ describe("officePlugin", () => {
     expect(renderDocxAsync.mock.calls.at(-1)?.[3]).toMatchObject({
       renderAltChunks: true,
       renderComments: true
+    });
+  });
+
+  it("keeps structural DOCX renderer hooks pinned for untyped callers", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const untypedOptions = {
+      className: "custom-docx",
+      inWrapper: false,
+      breakPages: false,
+      renderAltChunks: false
+    } as unknown as OfficeDocxRenderOptions;
+
+    createViewer({
+      container,
+      file: new Blob(["docx"], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      }),
+      fileName: "letter.docx",
+      plugins: [officePlugin({ docx: untypedOptions })]
+    });
+
+    await waitFor(() => Boolean(container.querySelector(".ofv-docx-document")));
+
+    expect(renderDocxAsync.mock.calls.at(-1)?.[3]).toMatchObject({
+      className: "ofv-docx",
+      inWrapper: true,
+      breakPages: true,
+      renderAltChunks: false
+    });
+  });
+
+  it("forwards safe DOCX options after detecting a package with a legacy extension", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+
+    createViewer({
+      container,
+      file: await createMinimalDocx("Mislabeled DOCX"),
+      fileName: "letter.doc",
+      plugins: [officePlugin({ docx: { renderComments: false, ignoreLastRenderedPageBreak: true } })]
+    });
+
+    await waitFor(() => Boolean(container.querySelector(".ofv-docx-document")));
+
+    expect(renderDocxAsync.mock.calls.at(-1)?.[3]).toMatchObject({
+      className: "ofv-docx",
+      inWrapper: true,
+      breakPages: true,
+      renderComments: false,
+      ignoreLastRenderedPageBreak: true
     });
   });
 
