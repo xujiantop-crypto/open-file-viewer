@@ -200,7 +200,7 @@ importers:
         specifier: ^3.4.10
         version: 3.4.10
       emf-converter:
-        specifier: ^2.0.2
+        specifier: 2.0.2
         version: 2.0.2
       heic2any:
         specifier: ^0.0.4
